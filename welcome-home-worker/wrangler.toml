@@ -1,0 +1,6 @@
+name = "welcome-home-worker"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# No route is committed: attach the custom domain in the Cloudflare dashboard
+# (Workers -> Triggers -> Custom Domains) so the hostname stays out of the repo.

@@ -1,0 +1,16 @@
+# Name, entry point, and compatibility date
+name = "commandcode-usage-tracker"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# 15-minute background sync (matches the Worker's CACHE_TTL_MS)
+[triggers]
+crons = ["*/15 * * * *"]
+
+# D1 database binding (create first, then paste the database_id)
+#   wrangler d1 create cc-usage-db
+#   wrangler d1 execute cc-usage-db --file=./schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "cc-usage-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

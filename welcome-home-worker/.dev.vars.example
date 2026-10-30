@@ -1,0 +1,15 @@
+# Local dev secrets — copy to `.dev.vars` and fill in. NEVER commit `.dev.vars`.
+# Production values go in: Cloudflare Dashboard → Worker → Settings → Variables and Secrets.
+
+# Wi-Fi network shown on the card and encoded into the QR code
+WIFI_SSID=
+WIFI_PASS=
+
+# Bluetooth speaker name shown on the read-only row
+BT_NAME=
+
+# Postal address rendered under "Address"
+HOME_ADDR=
+
+# Phone number for the WhatsApp link, digits only, with country code (e.g. 911234567890)
+WHATSAPP_NUM=

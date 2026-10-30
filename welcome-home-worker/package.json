@@ -1,0 +1,14 @@
+{
+  "name": "welcome-home-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Guest Wi-Fi landing page Worker: QR join, tap-to-copy credentials, contact link.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

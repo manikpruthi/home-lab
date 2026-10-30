@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Wrangler / Cloudflare
+.wrangler/
+.wrangler.toml
+
+# Local secrets (never commit the real file — only the .example template)
+.dev.vars
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

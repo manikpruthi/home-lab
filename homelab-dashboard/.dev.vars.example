@@ -1,0 +1,23 @@
+# Local dev secrets — copy to `.dev.vars` and fill in. NEVER commit `.dev.vars`.
+# Production values go in: Cloudflare Dashboard → Worker → Settings → Variables and Secrets.
+
+# Admin credentials for the force-sync and mute endpoints (HTTP Basic).
+# Both must be set, or every authenticated action returns 401.
+ADMIN_USER=
+ADMIN_PASS=
+
+# Optional shared secret sent as the x-worker-secret header to every health
+# endpoint. Leave blank if your endpoints do not require it.
+WORKER_SECRET=
+
+# Full URL of the Pi5 health API (returns the JSON produced by health.sh --json)
+PI5_HEALTH_URL=
+
+# Full URLs of the four Oracle VM health endpoints
+VM1_URL=
+VM2_URL=
+VM3_URL=
+VM4_URL=
+
+# Slack incoming webhook URL. Leave blank to disable alerting.
+SLACK_WEBHOOK=

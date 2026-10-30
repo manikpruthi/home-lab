@@ -1,0 +1,17 @@
+# Name, entry point, and compatibility date
+name = "homelab-dashboard"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Hourly snapshot of the Pi5 + four Oracle VMs
+[triggers]
+crons = ["0 * * * *"]
+
+# D1 binding. This MUST be the same database the uptime-monitor Worker writes to:
+# the dashboard renders the `ipv6_data` row that uptime-monitor owns.
+#   wrangler d1 create homelab-health-db
+#   wrangler d1 execute homelab-health-db --file=./schema.sql
+[[d1_databases]]
+binding = "HEALTH_DB"
+database_name = "homelab-health-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

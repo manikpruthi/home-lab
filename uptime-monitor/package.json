@@ -1,0 +1,15 @@
+{
+  "name": "uptime-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that probes an IPv6 endpoint, tracks state in D1, ships uptime metrics to InfluxDB, and alerts Slack on state transitions.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute homelab-health-db --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

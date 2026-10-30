@@ -1,0 +1,19 @@
+# Name, entry point, and compatibility date
+name = "uptime-monitor"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Probe cadence. 480 history points are retained in D1, so at */5 that is 40 hours of history.
+# Adjust to match how much history you want to keep.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# D1 database binding. This is the SAME database the homelab-dashboard Worker
+# reads: this Worker owns the `ipv6_data` row that the dashboard renders as its
+# IPv6 sparkline. Use one database_id for both Workers.
+#   wrangler d1 create homelab-health-db
+#   wrangler d1 execute homelab-health-db --file=./schema.sql
+[[d1_databases]]
+binding = "HEALTH_DB"
+database_name = "homelab-health-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

@@ -1,0 +1,13 @@
+# Local dev secrets — copy to `.dev.vars` and fill in. NEVER commit `.dev.vars`.
+# Production values go in: Cloudflare Dashboard → Worker → Settings → Variables and Secrets.
+
+# Admin login for /api/refresh and /api/dismiss-alert (plain text; stored encrypted by Cloudflare)
+ADMIN_USER=
+ADMIN_PASS=
+
+# Session cookie: __Secure-commandcode_prod_.session_token=<token>
+# Rotates server-side; can also be refreshed via the dashboard's Manual Refresh modal.
+CC_COOKIE=
+
+# API key for the billing-cycle summary (rotates on CLI re-login; find it in ~/.commandcode/auth.json as the "user_..." key)
+CC_API_KEY=
