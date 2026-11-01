@@ -3,9 +3,9 @@ name = "homelab-dashboard"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
-# Hourly snapshot of the Pi5 + four Oracle VMs
+# Snapshot every 15 minutes of the Pi5 + four Oracle VMs
 [triggers]
-crons = ["0 * * * *"]
+crons = ["*/15 * * * *"]
 
 # D1 binding. This MUST be the same database the uptime-monitor Worker writes to:
 # the dashboard renders the `ipv6_data` row that uptime-monitor owns.

@@ -21,3 +21,6 @@ VM4_URL=
 
 # Slack incoming webhook URL. Leave blank to disable alerting.
 SLACK_WEBHOOK=
+
+# Optional page title (defaults to "HomeLab Dashboard")
+DASHBOARD_TITLE=
