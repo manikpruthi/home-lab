@@ -8,6 +8,9 @@ node_modules/
 # Local secrets (never commit the real file — only the .example template)
 .dev.vars
 
+# Local Command Code config (project skills, taste learnings)
+.commandcode/
+
 # Logs
 *.log
 npm-debug.log*

@@ -33,6 +33,33 @@
 // 6. Dismissible Top Alerts with 24-Hour Snooze (Synced in D1 across Laptop & Mobile)
 // 7. Manual Refresh Modal (ADMIN_USER + ADMIN_PASS secrets, 2 Force Checkboxes, Cookie Fallback, Bookmarklet)
 // 8. Viewport-Clamped Hover/Tap Info Tooltips with Complete Color & Gradient Explanations
+// DEPLOYED BUILD (2026-11-01 review pass):
+// - MODEL IDENTITY: deepseek-v4-flash / deepseek-v41-flash are NOT renames of the
+//   "-fast" variants. CC now lists all four DeepSeek Flash models separately with
+//   separate caps ($60 / $20 / $100 / $60), so LEGACY_MODEL_ALIASES no longer
+//   collapses the base row into -fast. That alias both displayed the wrong model
+//   name and priced the $100-cap row at the $60-cap burn rate (1.67x over-read).
+// - OFFICIAL MODEL IDs: the GOAT table's display name is not the model id
+//   ("Beam 1.0" ships as beam-free, "Qwen 3.8 Max" as qwen3-8-max). The parser now
+//   keeps the /models/<id> link slug on each catalog entry and
+//   lookupCatalogModel resolves it, so in-app usage stops being flagged
+//   [UNMAPPED] and stops burning the 1x pool fallback.
+// - WINDOW RESET: a cached windowLimits snapshot whose resetAt has already passed
+//   belongs to the previous window. It now renders as an empty idle window instead
+//   of pinning the bar at the old 100% (tracker showed "full" while CC was empty).
+//   The diagnostics line also reports how old the cached window snapshot is.
+// - Free catalog models are labelled Free in the per-model table instead of
+//   "Unmapped (pool $)" and never take a pool-fallback burn.
+// - PER-REQUEST CREDIT FREEZING: every newly observed request is written to
+//   cc_request_credits with its model, sticker value, model cap, monthly pool,
+//   credit weight and the resulting credits. Credits are no longer re-derived
+//   from today's catalog on every page load, so an allowance change (DeepSeek
+//   V4.1 Flash $60/$70 -> $100) only applies to requests served after it. The
+//   daily rollup stores credits_consumed (-1 = row predates freezing, derive).
+//   The 7-day rolling ledger is read from D1 (cc_request_credits) instead of the
+//   old rolling_window_ledger_json meta blob, which retention deletes.
+// - D1 UPGRADE REQUIRED for existing databases before deploying this build: run
+//   the three statements in the "UPGRADING AN EXISTING DATABASE" block of schema.sql.
 // DEPLOYED BUILD (2026-10-27 review fixes + 2026-10-27 window-accuracy pass):
 // - Weekly reset renders Xd Yh (not raw 125.3h); reset timers anchor on the OLDEST
 //   request of any kind (billable, free, tool ping, $0) — CC opens each window on
@@ -44,7 +71,8 @@
 //   so a $10-cap model burns 7x. Stale 20/50/100 caches self-heal + force refetch.
 // - Canonical slugs (provider prefixes, doubled tokens, dotted versions) at every
 //   layer + one-time D1 migration merging legacy raw rows; per-model tables can
-//   no longer split one model into provider-prefixed duplicates.
+//   no longer split one model into provider-prefixed duplicates. Genuine renames
+//   live in LEGACY_MODEL_ALIASES (empty today - see the 2026-11-01 note above).
 // - Sync coverage (pages fetched, total entries, truncated flag, window span,
 //   top credit consumers) stored per sync and shown in System Info, so a
 //   truncated 7-day backfill is visible instead of a silent undercount.
@@ -58,9 +86,9 @@
 // - Cap inheritance: muse-*-contributor and deepseek-*-fast variants inherit the base
 //   model's monthlyCapUsd when missing (variant_cap_inheritance_ts pass) - the old
 //   pool-fallback 1x burn under-read capped variants.
-// - Confirmed renames alias in canonicalModelSlug (deepseek-v4-flash,
-//   deepseek-v41-flash -> deepseek-v41-flash-fast); daily rows also merge by
-//   canonical key at read time, and the legacy-row migration runs on forced refresh.
+// - Daily rows merge by canonical key at read time, and the legacy-row migration
+//   runs on forced refresh. (Only confirmed renames belong in LEGACY_MODEL_ALIASES;
+//   DeepSeek Flash variants are separate models - see the 2026-11-01 note.)
 // - UI separators are plain ASCII (|, ->, -) so a Latin-1 decode can't mojibake them.
 // - XSS: escHtml/escAttr on all catalog/alert/model strings; dismiss via
 //   data-attribute + listener instead of inline onclick string concat.
@@ -117,21 +145,23 @@
 // ============================================================================
 
 const BUILTIN_TOOLS = new Set(["web-search", "web-fetch", "code-search", "mcp-tool"]);
-// User-confirmed renames: the same DeepSeek model shipped under several raw names
-// across revisions. Mechanical canonicalization can't merge v4 with v41 (those read
-// as genuinely different versions), so these exact legacy slugs alias to the newest
-// canonical key. Keep this list to confirmed renames only - a wrong entry would pace
-// usage against the wrong monthly cap.
-const LEGACY_MODEL_ALIASES = {
-  "deepseek-v4-flash": "deepseek-v41-flash-fast",
-  "deepseek-v41-flash": "deepseek-v41-flash-fast"
-};
+// Confirmed renames ONLY: slugs that identify the SAME model under an old name.
+// Do NOT alias model variants together. Command Code ships four distinct DeepSeek
+// Flash models today - V4 Flash, V4 Flash Fast, V4.1 Flash and V4.1 Flash Fast -
+// with different monthly caps ($60 / $20 / $100 / $60). Merging the base row into
+// its "-fast" variant mislabels the dashboard AND paces credits against the wrong
+// cap (70/60 instead of 70/100 = a 1.67x over-read of the weekly window).
+const LEGACY_MODEL_ALIASES = {};
 // Command Code's session cookie. CC rotates this token server-side, so any
 // static pasted copy goes stale fast - captureSessionCookieRotation() keeps the
 // stored copy current from Set-Cookie response headers.
 const SESSION_COOKIE_NAME = "__Secure-commandcode_prod_.session_token";
 const CACHE_TTL_MS = 15 * 60 * 1000;            // 15 minutes usage auto-refresh TTL (matches 15m Cron)
 const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;     // 24 hours pricing/catalog & alert snooze TTL
+// Bump when the catalog parser changes shape (keys, ids, caps). One sync after a
+// deploy re-scrapes the docs regardless of the 10 AM IST rule, so a cached catalog
+// written by an older parser can't keep mis-pricing models for a day.
+const CATALOG_SCHEMA_VERSION = "2026-11-01-model-id";
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;       // 5-hour rolling window
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;  // 7-day weekly rolling window
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;     // UTC+05:30 (India Standard Time)
@@ -344,8 +374,9 @@ export default {
           }
           const catalogMap = await getCachedCatalogMap(env.DB);
           const seenSet = await getBoundedSeenSet(env.DB);
-          const { newRecordsCount, writeLatencyMs, dbMeta } = await ingestUsageItems(env.DB, usages, seenSet, catalogMap);
-          await updateRollingWindowLedger(env.DB, usages);
+          const capsForIngest = safeJsonParse(await getMeta(env.DB, "goat_window_caps_json"), null);
+          const monthlyPoolForIngest = (capsForIngest && Number(capsForIngest.monthlyPoolUsd)) || 70;
+          const { newRecordsCount, writeLatencyMs, dbMeta } = await ingestUsageItems(env.DB, usages, seenSet, catalogMap, [], monthlyPoolForIngest);
           await enforceRetentionAndMeta(env, newRecordsCount, "OK (Bookmarklet Push)", { writeLatencyMs, dbMeta });
           return jsonResponse({ ok: true, newRecordsCount }, 200, CORS_HEADERS);
         } finally {
@@ -590,18 +621,30 @@ async function syncUsageDataUnlocked(env, forced = false, forcePriceSync = false
     }
   }
 
-  // Update 5-Hour & 7-Day Rolling Window Ledger from fetched requests
-  if (allFetchedUsages.length > 0) {
-    await updateRollingWindowLedger(db, allFetchedUsages);
-  }
-
-  // Ingest fetched usage items into D1 daily rollup
+  // Ingest fetched usage items into D1: daily rollup + the per-request credit
+  // ledger (cc_request_credits). The credit basis is the monthly pool in effect
+  // right now, read AFTER the catalog sync so a same-sync allowance change is
+  // already reflected in the frozen per-request credits.
   let lastDbMeta = null;
   if (allFetchedUsages.length > 0) {
-    const batchResult = await ingestUsageItems(db, allFetchedUsages, seenSet, catalogMap, syncErrors);
-    newRecordsCount += batchResult.newRecordsCount;
-    latencies.sqlWriteMs += batchResult.writeLatencyMs;
-    lastDbMeta = batchResult.dbMeta;
+    const capsForIngest = safeJsonParse(await getMeta(db, "goat_window_caps_json"), null);
+    const monthlyPoolForIngest = (capsForIngest && Number(capsForIngest.monthlyPoolUsd)) || 70;
+    try {
+      const batchResult = await ingestUsageItems(db, allFetchedUsages, seenSet, catalogMap, syncErrors, monthlyPoolForIngest);
+      newRecordsCount += batchResult.newRecordsCount;
+      latencies.sqlWriteMs += batchResult.writeLatencyMs;
+      lastDbMeta = batchResult.dbMeta;
+    } catch (ingestErr) {
+      // Most likely an unapplied schema upgrade (see schema.sql): a missing
+      // cc_request_credits table or credits_consumed column fails the whole
+      // batch. Surface it as an alert instead of letting the cron die silently.
+      syncErrors.push({
+        source: "DB_SCHEMA",
+        code: "INGEST",
+        message: `Per-request ingest failed: ${ingestErr && ingestErr.message}. If this mentions a missing table/column, run the upgrade statements in schema.sql, then redeploy.`,
+        ts: new Date().toISOString()
+      });
+    }
   }
 
   const nowTs = await enforceRetentionAndMeta(env, newRecordsCount, "OK", {
@@ -643,6 +686,7 @@ async function maybeSyncDynamicCatalogAndPricing(db, forced, forcePriceSync, for
     "last_price_sync_date_ist",
     "last_catalog_sync_ts",
     "last_catalog_sync_date_ist",
+    "catalog_schema_version",
     "goat_window_caps_json",
     "intelligence_inheritance_ts",
     "variant_cap_inheritance_ts"
@@ -654,6 +698,8 @@ async function maybeSyncDynamicCatalogAndPricing(db, forced, forcePriceSync, for
   // Old caches written before the inheritance pass existed need one migration run.
   // The v2 key covers cap inheritance + alias-aware slugs, which the first pass lacked.
   const needsInheritance = !cached.intelligence_inheritance_ts || !cached.variant_cap_inheritance_ts;
+  // Entries written by an older parser lack model ids / carry the old merged keys.
+  const catalogSchemaStale = cached.catalog_schema_version !== CATALOG_SCHEMA_VERSION;
 
   // Stale caps were usage-DOLLARS scraped from the Limits table (20/50/100),
   // not credits (14/35/70). Anything at/above the credit scale is wrong: force
@@ -677,7 +723,8 @@ async function maybeSyncDynamicCatalogAndPricing(db, forced, forcePriceSync, for
     (istHour >= 10 && lastCatDateIst !== todayIstStr) ||
     (forced && (nowMs - lastCatSyncTs >= CATALOG_TTL_MS)) ||
     !hasGoatModels ||
-    capsNeedFix;
+    capsNeedFix ||
+    catalogSchemaStale;
 
   const errors = [];
   let pricingLatencyMs = 0;
@@ -737,6 +784,7 @@ async function maybeSyncDynamicCatalogAndPricing(db, forced, forcePriceSync, for
           catalogUpdated = true;
           pendingMetaWrites.last_catalog_sync_ts = String(nowMs);
           pendingMetaWrites.last_catalog_sync_date_ist = todayIstStr;
+          pendingMetaWrites.catalog_schema_version = CATALOG_SCHEMA_VERSION;
         }
       }
     } catch (e) {
@@ -923,6 +971,20 @@ function getActiveModelRatesAtTime(catItem, timestampMs = Date.now()) {
   return { ...catItem, isPeakActive: false };
 }
 
+// The GOAT table's first cell links every model to /models/<official-id>. The
+// display name is NOT the id ("Beam 1.0" ships as beam-free, "Qwen 3.8 Max" as
+// qwen3-8-max, "Nemotron 3 Ultra" as nemotron-3-ultra-550b-a55b), and the usage
+// feed reports the id, so the catalog keeps it for lookups. The link text is also
+// the clean display name - the rest of the cell holds the Free/deal badge and the
+// peak-pricing note.
+function extractDocModelId(rawCell) {
+  const m = /<a[^>]+href=["'][^"']*\/models\/([^"'?#]+)["'][^>]*>([\s\S]*?)<\/a>/i.exec(String(rawCell || ""));
+  if (!m) return null;
+  const modelId = canonicalModelSlug(m[1]);
+  if (!modelId) return null;
+  return { modelId, linkName: stripHtml(m[2]) };
+}
+
 // Parses all 3 HTML tables on https://commandcode.ai/docs/plans/goat dynamically
 function parseAllGoatTablesHtml(html, roleMap = {}) {
   const catalog = {};
@@ -943,23 +1005,29 @@ function parseAllGoatTablesHtml(html, roleMap = {}) {
     let rowMatch;
     while ((rowMatch = rowRegex.exec(tableHtml)) !== null) {
       const cells = [];
+      let rawCell0Html = "";
       const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
       let tdMatch;
       while ((tdMatch = tdRegex.exec(rowMatch[1])) !== null) {
+        // The model link (and its official id) only exists in the raw first cell.
+        if (cells.length === 0) rawCell0Html = tdMatch[1];
         cells.push(stripHtml(tdMatch[1]));
       }
       if (cells.length < 4) continue;
 
       const rawCell0 = cells[0];
-      const cleanName = cleanModelTitle(rawCell0);
+      const docModel = extractDocModelId(rawCell0Html);
+      const cleanName = cleanModelTitle(docModel && docModel.linkName ? docModel.linkName : rawCell0);
       const slug = normalizeModelSlug(cleanName);
       if (!slug || slug === "model") continue;
+      const modelId = docModel ? docModel.modelId : null;
 
       const parsedPeak = parsePeakScheduleFromCell(rawCell0);
 
       if (!catalog[slug]) {
         catalog[slug] = {
           slug,
+          modelId,
           name: cleanName,
           contextWindow: null,
           intelligence: null,
@@ -981,6 +1049,7 @@ function parseAllGoatTablesHtml(html, roleMap = {}) {
       } else if (parsedPeak && !catalog[slug].peakSchedule) {
         catalog[slug].peakSchedule = parsedPeak;
       }
+      if (modelId && !catalog[slug].modelId) catalog[slug].modelId = modelId;
 
       // Table 1: Model | Context | Intelligence | Input | Output | Cache read | Cache write | Caps
       if (headerSig.includes("intelligence")) {
@@ -1202,44 +1271,12 @@ function makeAlertKey(err) {
 }
 
 // ============================================================================
-// 5-Hour & 7-Day Weekly Rolling Window Ledger & Counter Computation
+// 5-Hour & 7-Day Weekly Rolling Window & Counter Computation
 // ============================================================================
-async function updateRollingWindowLedger(db, usages) {
-  const raw = await getMeta(db, "rolling_window_ledger_json");
-  const ledger = safeJsonParse(raw, {});
-  const cutoffMs = Date.now() - SEVEN_DAYS_MS;
-
-  for (const [id, entry] of Object.entries(ledger)) {
-    if (!entry || entry.ts < cutoffMs) { delete ledger[id]; continue; }
-    // One-time canonicalization: legacy rows stored pre-canonical slugs
-    // ("deepseek/deepseek-v4-flash") remap to the canonical key in place.
-    if (entry.slug && typeof entry.slug === "string") {
-      const canon = canonicalModelSlug(entry.slug);
-      if (canon && canon !== entry.slug) entry.slug = canon;
-    }
-  }
-
-  for (const u of usages) {
-    if (!u || !u.id || !u.createdAt) continue;
-    const ts = new Date(u.createdAt).getTime();
-    if (Number.isNaN(ts) || ts < cutoffMs) continue;
-    const meta = u.meta || {};
-    const slug = normalizeModelSlug(meta.model || "unknown");
-    const apiCost = Number(meta.totalCost || 0);
-    // CREDIT BASIS FIX: windows draw credits against STICKER usage-value, not billed $
-    const stickerCost = Number(
-      (Number(meta.inputCost || 0) + Number(meta.outputCost || 0) + Number(meta.cacheCost || 0)).toFixed(6)
-    );
-    ledger[u.id] = {
-      ts,
-      slug,
-      apiCost,
-      stickerCost: (Number.isFinite(stickerCost) && stickerCost > 0) ? stickerCost : apiCost
-    };
-  }
-
-  await setMeta(db, "rolling_window_ledger_json", JSON.stringify(ledger));
-}
+// The per-request ledger lives in cc_request_credits (rows are written by
+// ingestUsageItems with their credit basis frozen at observation time), so the
+// rolling windows read straight from D1 instead of rebuilding a JSON blob on
+// every sync.
 
 // ---------------------------------------------------------------------------
 // Session-token rotation capture. CC mints a fresh session_token on its own
@@ -1430,13 +1467,24 @@ function computeRollingWindows(ledgerMap, catalogMap, windowCaps, windowLimits, 
     const isToolEntry = BUILTIN_TOOLS.has(item.slug) || Boolean(cat && cat.isTool);
     const isFreeEntry = Boolean(cat && cat.isFree);
     const billable = !isToolEntry && !isFreeEntry && Number.isFinite(sticker) && sticker > 0;
-    const modelCap = cat && cat.monthlyCapUsd ? Number(cat.monthlyCapUsd) : monthlyPool;
-    // Lower-allowance models draw proportionally more pool credits per $1 of sticker usage.
-    // Free/tool models always drain 0 (no fallback weight of 1).
-    const creditWeight = (isToolEntry || isFreeEntry)
-      ? 0
-      : (monthlyPool && modelCap && modelCap > 0) ? (monthlyPool / modelCap) : 1;
-    const weighted = sticker * creditWeight;
+    // Per-request credits are frozen at ingest against the allowance in effect
+    // THEN; prefer them. A later allowance change (e.g. DeepSeek V4.1 Flash
+    // $60 -> $100) must not retroactively re-price billing history. Only rows
+    // observed before credit freezing fall back to today's catalog.
+    const frozenCredits = (item.credits === null || item.credits === undefined) ? NaN : Number(item.credits);
+    const hasFrozenCredits = Number.isFinite(frozenCredits);
+    let weighted;
+    if (hasFrozenCredits) {
+      weighted = frozenCredits;
+    } else {
+      const modelCap = cat && cat.monthlyCapUsd ? Number(cat.monthlyCapUsd) : monthlyPool;
+      // Lower-allowance models draw proportionally more pool credits per $1 of sticker usage.
+      // Free/tool models always drain 0 (no fallback weight of 1).
+      const creditWeight = (isToolEntry || isFreeEntry)
+        ? 0
+        : (monthlyPool && modelCap && modelCap > 0) ? (monthlyPool / modelCap) : 1;
+      weighted = sticker * creditWeight;
+    }
 
     // Raw/market + sticker totals still reflect every ledger row for diagnostics.
     raw7d += apiCost;
@@ -1512,6 +1560,28 @@ function computeRollingWindows(ledgerMap, catalogMap, windowCaps, windowLimits, 
   // sticker $, and the 5h per-model breakdown, which the 24h feed does cover).
   const overrideWindow = (win, wl, windowMs) => {
     if (!wl || !Number.isFinite(wl.resetAt) || wl.resetAt <= 0 || !(wl.cap > 0)) return win;
+    // A cached snapshot whose resetAt has already passed describes the PREVIOUS
+    // window. CC opens a new window at zero on the first request, and its own page
+    // shows an empty meter until then - a cached "full" snapshot must not pin the
+    // bar at 100% while CC shows an empty tracker. Render the idle window; the next
+    // sync (<= 15m) fills in any usage that has accumulated in the new window.
+    if (wl.resetAt <= now) {
+      return {
+        ...win,
+        limitCredits: wl.cap,
+        usedCredits: 0,
+        leftCredits: wl.cap,
+        usedPct: 0,
+        resetsInMs: 0,
+        resetsInMinutes: 0,
+        resetsInHours: 0,
+        resetsAtIso: null,
+        windowOpenedAt: null,
+        windowSource: "cc-billing-limits",
+        windowExpired: true,
+        capsMissing: false
+      };
+    }
     const used = Number(wl.used) || 0;
     const resetsInMs = Math.max(0, wl.resetAt - now);
     return {
@@ -1549,19 +1619,47 @@ function computeRollingWindows(ledgerMap, catalogMap, windowCaps, windowLimits, 
   return {
     fiveHour: overrideWindow(fiveHourBase, windowLimits && windowLimits.fiveHour, FIVE_HOURS_MS),
     weekly: Object.assign(overrideWindow(weeklyBase, windowLimits && windowLimits.weekly, SEVEN_DAYS_MS), { topModels: topModels7d }),
-    monthlyPool: windowLimits ? { used: windowLimits.monthlyUsed || 0, granted: windowLimits.monthlyGranted || 0 } : null
+    monthlyPool: windowLimits ? { used: windowLimits.monthlyUsed || 0, granted: windowLimits.monthlyGranted || 0 } : null,
+    // When the cached snapshot was captured - the UI shows its age, so a bar that
+    // could not be refreshed (dead cookie) is visibly stale instead of "exact".
+    windowLimitsFetchedAt: (windowLimits && Number(windowLimits.fetchedAt)) ? Number(windowLimits.fetchedAt) : null
   };
 }
 
 // ============================================================================
 // Batched Ingestion Helper (Evaluates Time-of-Day Peak/Off-Peak Rates per Turn)
 // ============================================================================
-async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []) {
+// Freezes ONE request's credit cost using the allowance in effect at ingest time.
+// CC prices each request against the model's monthly allowance when it is served,
+// so storing the inputs (cap, pool, weight) + result keeps a later allowance change
+// from re-pricing history. Free/tool rows burn 0; a model missing from the catalog
+// keeps the 1x pool fallback used by the rolling-window estimate.
+function computeRequestCredits(catalogItem, stickerUsd, monthlyPoolUsd) {
+  const pool = (monthlyPoolUsd && Number(monthlyPoolUsd) > 0) ? Number(monthlyPoolUsd) : 70;
+  const isFree = Boolean(catalogItem && catalogItem.isFree);
+  const isTool = Boolean(catalogItem && catalogItem.isTool);
+  if (isFree || isTool) {
+    return { credits: 0, weight: 0, modelCapUsd: isFree ? 0 : null, poolUsd: pool };
+  }
+  const rawCap = catalogItem ? catalogItem.monthlyCapUsd : null;
+  const modelCapUsd = (rawCap !== null && rawCap !== undefined) ? Number(rawCap) : null;
+  const weight = (modelCapUsd && modelCapUsd > 0) ? pool / modelCapUsd : 1;
+  const sticker = Number(stickerUsd) || 0;
+  return {
+    credits: Number((sticker * weight).toFixed(6)),
+    weight: Number(weight.toFixed(6)),
+    modelCapUsd,
+    poolUsd: pool
+  };
+}
+
+async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = [], monthlyPoolUsd = null) {
   let hitAlreadySeen = false;
   let newRecordsCount = 0;
   const statements = [];
   const lookupMemo = new Map();
   const reportedMissing = buildReportedMissingSet(syncErrors);
+  const observedAt = Date.now();
 
   for (const item of usages) {
     if (!item || !item.id) continue;
@@ -1614,14 +1712,34 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
         (tokensInTotal > 0 && tokensOut === 0)
       ) ? 1 : 0;
 
+    // Freeze the credit basis for this request NOW (see computeRequestCredits).
+    // Sticker usage-value is what CC paces allowances against; fall back to the
+    // billed amount for the rare turn where the sticker components are missing.
+    const stickerCost = Number((inputCost + cacheCost + outputCost).toFixed(6));
+    const stickerBasis = (Number.isFinite(stickerCost) && stickerCost > 0) ? stickerCost : planCost;
+    const creditInfo = computeRequestCredits(baseRates, stickerBasis, monthlyPoolUsd);
+
     statements.push(
       db.prepare(`INSERT OR IGNORE INTO cc_seen_requests (id, created_at) VALUES (?, ?)`).bind(item.id, item.createdAt || new Date().toISOString()),
+      // Per-request credit ledger: the frozen basis lives in its own table so the
+      // hot dedupe table stays narrow and the upgrade needs no column migration.
+      db.prepare(`
+        INSERT OR IGNORE INTO cc_request_credits (
+          id, created_at, usage_date, model, sticker_usd, billed_usd,
+          model_cap_usd, pool_usd, credit_weight, credits, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        item.id, item.createdAt || new Date().toISOString(), usageDate, model,
+        stickerBasis, planCost, creditInfo.modelCapUsd, creditInfo.poolUsd,
+        creditInfo.weight, creditInfo.credits, observedAt
+      ),
       db.prepare(`
         INSERT INTO cc_daily_model_usage (
           usage_date, model, requests_count, failed_wasted_count,
           tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out,
-          plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total
-        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total,
+          credits_consumed
+        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(usage_date, model) DO UPDATE SET
           requests_count = requests_count + 1,
           failed_wasted_count = failed_wasted_count + excluded.failed_wasted_count,
@@ -1634,11 +1752,17 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
           cache_cost = cache_cost + excluded.cache_cost,
           output_cost = output_cost + excluded.output_cost,
           actual_api_cost = actual_api_cost + excluded.actual_api_cost,
-          duration_ms_total = duration_ms_total + excluded.duration_ms_total
+          duration_ms_total = duration_ms_total + excluded.duration_ms_total,
+          -- -1 marks a row written before credit freezing: replace it with this
+          -- batch's frozen total instead of adding to the sentinel.
+          credits_consumed = CASE WHEN credits_consumed < 0
+            THEN excluded.credits_consumed
+            ELSE credits_consumed + excluded.credits_consumed END
       `).bind(
         usageDate, model, isFailedOrWasted,
         tokensInTotal, tokensInFresh, tokensCached, tokensOut,
-        planCost, inputCost, cacheCost, outputCost, planCost, durationMs
+        planCost, inputCost, cacheCost, outputCost, planCost, durationMs,
+        creditInfo.credits
       )
     );
     newRecordsCount++;
@@ -1701,7 +1825,11 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
   const retentionPromise = runRetention
     ? db.batch([
         db.prepare(`DELETE FROM cc_daily_model_usage WHERE usage_date < ?`).bind(rollupCutoffIst),
-        db.prepare(`DELETE FROM cc_seen_requests WHERE substr(created_at, 1, 10) < date('now', ?)`).bind(`-${SEEN_RETENTION_DAYS} days`)
+        db.prepare(`DELETE FROM cc_seen_requests WHERE substr(created_at, 1, 10) < date('now', ?)`).bind(`-${SEEN_RETENTION_DAYS} days`),
+        db.prepare(`DELETE FROM cc_request_credits WHERE substr(created_at, 1, 10) < date('now', ?)`).bind(`-${SEEN_RETENTION_DAYS} days`),
+        // Pre-2026-11-01 the rolling ledger lived in this JSON meta blob. It is no
+        // longer read (cc_request_credits is the ledger now); reclaim the space.
+        db.prepare(`DELETE FROM cc_meta WHERE key = 'rolling_window_ledger_json'`)
       ])
     : Promise.resolve(null);
 
@@ -1718,7 +1846,7 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
     ? (async () => {
         try {
           const legacyRows = await db.prepare(
-            `SELECT usage_date, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total FROM cc_daily_model_usage LIMIT 5000`
+            `SELECT usage_date, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total, credits_consumed FROM cc_daily_model_usage LIMIT 5000`
           ).all();
           const remap = [];
           for (const r of (legacyRows.results || [])) {
@@ -1737,7 +1865,8 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
               cache_cost: Number(r.cache_cost || 0),
               output_cost: Number(r.output_cost || 0),
               actual_api_cost: Number(r.actual_api_cost || 0),
-              duration_ms_total: Number(r.duration_ms_total || 0)
+              duration_ms_total: Number(r.duration_ms_total || 0),
+              credits_consumed: Number(r.credits_consumed === null || r.credits_consumed === undefined ? -1 : r.credits_consumed)
             });
           }
           if (remap.length === 0) return null;
@@ -1752,6 +1881,11 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
             for (const f of ["requests_count", "failed_wasted_count", "tokens_in_total", "tokens_in_fresh", "tokens_cached", "tokens_out", "plan_cost", "input_cost", "cache_cost", "output_cost", "actual_api_cost", "duration_ms_total"]) {
               g[f] = Number(g[f] || 0) + Number(m[f] || 0);
             }
+            // -1 means "no frozen credits"; never add it to a real total.
+            const gCredits = Number(g.credits_consumed);
+            const mCredits = Number(m.credits_consumed);
+            g.credits_consumed = (gCredits >= 0 && mCredits >= 0) ? gCredits + mCredits
+              : (gCredits >= 0 ? gCredits : (mCredits >= 0 ? mCredits : -1));
           }
           const stmts = [];
           for (const m of grouped.values()) {
@@ -1760,8 +1894,9 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
               INSERT INTO cc_daily_model_usage (
                 usage_date, model, requests_count, failed_wasted_count,
                 tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out,
-                plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total,
+                credits_consumed
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(usage_date, model) DO UPDATE SET
                 requests_count = requests_count + excluded.requests_count,
                 failed_wasted_count = failed_wasted_count + excluded.failed_wasted_count,
@@ -1774,12 +1909,17 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
                 cache_cost = cache_cost + excluded.cache_cost,
                 output_cost = output_cost + excluded.output_cost,
                 actual_api_cost = actual_api_cost + excluded.actual_api_cost,
-                duration_ms_total = duration_ms_total + excluded.duration_ms_total
+                duration_ms_total = duration_ms_total + excluded.duration_ms_total,
+                credits_consumed = CASE
+                  WHEN credits_consumed < 0 THEN excluded.credits_consumed
+                  WHEN excluded.credits_consumed < 0 THEN credits_consumed
+                  ELSE credits_consumed + excluded.credits_consumed END
             `).bind(
               m.usage_date, m.canon,
               m.requests_count, m.failed_wasted_count,
               m.tokens_in_total, m.tokens_in_fresh, m.tokens_cached, m.tokens_out,
-              m.plan_cost, m.input_cost, m.cache_cost, m.output_cost, m.actual_api_cost, m.duration_ms_total
+              m.plan_cost, m.input_cost, m.cache_cost, m.output_cost, m.actual_api_cost, m.duration_ms_total,
+              m.credits_consumed
             ));
             // ...then delete the legacy row (guarded so a same-value row survives).
             stmts.push(db.prepare(
@@ -1839,6 +1979,16 @@ function lookupCatalogModel(model, catalogMap, syncErrors = [], memo = null, rep
     if (memo) memo.set(slug, exact);
     return exact;
   }
+  // Official model id exact match. The GOAT docs key a model by its display name
+  // ("Beam 1.0", "Qwen 3.8 Max") while the usage feed reports the /models/<id>
+  // slug (beam-free, qwen3-8-max). Resolve that before the fuzzy prefix pass so a
+  // correctly-catalogued model is never flagged unmapped / charged the 1x fallback.
+  for (const v of Object.values(catalogMap || {})) {
+    if (v && v.modelId && v.modelId === slug) {
+      if (memo) memo.set(slug, v);
+      return v;
+    }
+  }
   // Longest-prefix wins: a short shared prefix (e.g. "gpt") must not shadow a
   // longer, closer variant cap ($10 vs $80 = 8x credit error).
   let best = null;
@@ -1892,18 +2042,23 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
   // usage_date is an IST calendar date: compute the cutoff in JS (IST). The old
   // UTC date('now', ...) predicate drifted a day around midnight IST.
   const rollupCutoffIst = istDateStr(Date.now() - ROLLUP_RETENTION_DAYS * 86400000);
-  const [dailyRowsRes, countsRes, metaRowsRes] = await db.batch([
-    db.prepare(`SELECT usage_date, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost FROM cc_daily_model_usage WHERE usage_date >= ? ORDER BY usage_date DESC, plan_cost DESC`).bind(rollupCutoffIst),
+  // Per-request ledger for the rolling windows (7 days; rows older than that are
+  // irrelevant to both windows and are pruned by the 91-day retention pass).
+  const ledgerCutoffIso = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
+  const [dailyRowsRes, countsRes, metaRowsRes, ledgerRowsRes] = await db.batch([
+    db.prepare(`SELECT usage_date, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost, credits_consumed FROM cc_daily_model_usage WHERE usage_date >= ? ORDER BY usage_date DESC, plan_cost DESC`).bind(rollupCutoffIst),
     db.prepare(`
       SELECT
         (SELECT COUNT(*) FROM cc_daily_model_usage) AS daily_rows_count,
         (SELECT COUNT(*) FROM cc_seen_requests) AS seen_requests_count,
+        (SELECT COUNT(*) FROM cc_request_credits) AS request_credits_count,
         (SELECT COUNT(*) FROM cc_meta) AS meta_rows_count,
         (SELECT MIN(usage_date) FROM cc_daily_model_usage) AS oldest_date,
         (SELECT MAX(usage_date) FROM cc_daily_model_usage) AS newest_date,
         (SELECT COUNT(DISTINCT usage_date) FROM cc_daily_model_usage) AS active_days
     `),
-    db.prepare(`SELECT key, value FROM cc_meta`)
+    db.prepare(`SELECT key, value FROM cc_meta`),
+    db.prepare(`SELECT id, created_at, model, sticker_usd, billed_usd, credits FROM cc_request_credits WHERE created_at >= ?`).bind(ledgerCutoffIso)
   ]);
   const sqlReadLatencyMs = Math.round(performance.now() - tSql0);
 
@@ -1912,7 +2067,22 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
 
   const catalogMap = safeJsonParse(metaMap.model_pricing_json, {});
   const windowCaps = safeJsonParse(metaMap.goat_window_caps_json, null);
-  const ledgerMap = safeJsonParse(metaMap.rolling_window_ledger_json, {});
+  // Rebuild the rolling-window ledger shape from the per-request rows. `credits`
+  // is the frozen per-request cost (null on rows observed before credit freezing,
+  // which computeRollingWindows re-derives from today's catalog).
+  const ledgerMap = {};
+  for (const row of (ledgerRowsRes.results || [])) {
+    const ts = new Date(row.created_at).getTime();
+    if (!Number.isFinite(ts)) continue;
+    const frozen = row.credits === null || row.credits === undefined ? null : Number(row.credits);
+    ledgerMap[row.id] = {
+      ts,
+      slug: row.model,
+      apiCost: Number(row.billed_usd) || 0,
+      stickerCost: row.sticker_usd === null || row.sticker_usd === undefined ? null : Number(row.sticker_usd),
+      credits: frozen !== null && Number.isFinite(frozen) ? frozen : null
+    };
+  }
   const dismissedMap = safeJsonParse(metaMap.dismissed_alerts_json, {});
   const rawErrors = safeJsonParse(metaMap.sync_errors_json, []);
   const syncErrors = rawErrors.filter(e => !(e.model && BUILTIN_TOOLS.has(e.model)));
@@ -1942,9 +2112,10 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
   const lookupWarnings = [];
   const enrichMemo = new Map();
   const reportedMissing = buildReportedMissingSet(lookupWarnings);
-  // Legacy rows written under pre-alias raw names (deepseek-v4-flash,
-  // deepseek-v41-flash) merge into the canonical model at read time, so the
-  // per-model tables show one DeepSeek row even before the D1 merge runs.
+  // Legacy rows written under pre-alias raw names merge into the canonical model at
+  // read time (LEGACY_MODEL_ALIASES is empty today: DeepSeek Flash variants are
+  // separate models). Rows ingested while the old base->-fast alias was live stay
+  // under the -fast key - there is no raw name left in the rollup to split them.
   const mergedRowsMap = new Map();
   for (const r of rawRows) {
     const canonModel = canonicalModelSlug(r.model);
@@ -1963,24 +2134,46 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
       agg.input_cost = Number(agg.input_cost || 0) + Number(r.input_cost || 0);
       agg.cache_cost = Number(agg.cache_cost || 0) + Number(r.cache_cost || 0);
       agg.output_cost = Number(agg.output_cost || 0) + Number(r.output_cost || 0);
+      // Sentinel-aware merge: -1 means "no frozen credits" and never contributes.
+      const aggCredits = Number(agg.credits_consumed);
+      const rowCredits = Number(r.credits_consumed);
+      agg.credits_consumed = (aggCredits >= 0 && rowCredits >= 0) ? aggCredits + rowCredits
+        : (aggCredits >= 0 ? aggCredits : (rowCredits >= 0 ? rowCredits : -1));
     }
   }
   const enrichedRows = [...mergedRowsMap.values()].map(r => {
     const cat = lookupCatalogModel(r.model, catalogMap, lookupWarnings, enrichMemo, reportedMissing);
+    const isFreeModel = Boolean(cat.isFree);
     let capUsd = (cat.monthlyCapUsd !== null && cat.monthlyCapUsd !== undefined) ? Number(cat.monthlyCapUsd) : null;
     // Unmapped models: fall back to the monthly pool ($70) so pool drain stays
     // dimensionally sane, but flag the row and keep net savings neutral (0)
-    // instead of crediting the full market value as fake ROI.
-    const unmappedAllowance = !(capUsd && capUsd > 0);
-    if (unmappedAllowance && monthlyPoolUsd && monthlyPoolUsd > 0) capUsd = monthlyPoolUsd;
+    // instead of crediting the full market value as fake ROI. Free models are NOT
+    // unmapped - they carry no cap by design and drain 0 credits.
+    const unmappedAllowance = !isFreeModel && !(capUsd && capUsd > 0);
+    if (!isFreeModel && unmappedAllowance && monthlyPoolUsd && monthlyPoolUsd > 0) capUsd = monthlyPoolUsd;
     const stickerPool = monthlyPoolUsd && monthlyPoolUsd > 0 ? monthlyPoolUsd : 70;
     const stickerValue = Number(r.input_cost || 0) + Number(r.cache_cost || 0) + Number(r.output_cost || 0);
+    // Frozen credits (>= 0) were captured with the allowance in effect when those
+    // requests were ingested, so a later allowance change cannot re-price this row.
+    // -1 marks a row written before credit freezing: derive from today's catalog.
+    const storedCredits = (r.credits_consumed === null || r.credits_consumed === undefined) ? NaN : Number(r.credits_consumed);
+    const hasStoredCredits = Number.isFinite(storedCredits) && storedCredits >= 0;
     // Credit burn: pool credits consumed per $1 of sticker usage = monthlyPool / modelCap.
-    // A $10-cap model burns 7x (70/10); a $70-cap model burns 1x. This is exactly
-    // how CC paces the 5h / weekly / monthly limits.
-    const creditBurnPerUsd = (capUsd && capUsd > 0) ? Number((stickerPool / capUsd).toFixed(3)) : null;
-    const creditsConsumed = (creditBurnPerUsd !== null) ? Number((stickerValue * creditBurnPerUsd).toFixed(4)) : 0;
-    const poolDrainFraction = (capUsd && capUsd > 0) ? (stickerValue / capUsd) : 0;
+    // A $10-cap model burns 7x (70/10); a $70-cap model burns 1x; a free model burns 0.
+    // For frozen rows, use the actual blended ratio (credits / sticker) so the column
+    // reflects the allowance that was live at the time, not today's.
+    const creditBurnPerUsd = isFreeModel ? 0
+      : (hasStoredCredits && stickerValue > 0
+          ? Number((storedCredits / stickerValue).toFixed(3))
+          : ((capUsd && capUsd > 0) ? Number((stickerPool / capUsd).toFixed(3)) : null));
+    const creditsConsumed = isFreeModel ? 0
+      : (hasStoredCredits
+          ? Number(storedCredits.toFixed(4))
+          : ((creditBurnPerUsd !== null) ? Number((stickerValue * creditBurnPerUsd).toFixed(4)) : 0));
+    const poolDrainFraction = isFreeModel ? 0
+      : (hasStoredCredits
+          ? Number((storedCredits / stickerPool).toFixed(6))
+          : ((capUsd && capUsd > 0) ? (stickerValue / capUsd) : 0));
     const realPocketCost = poolDrainFraction * GOAT_PAID_USD;
     const netPlanSavings = unmappedAllowance ? 0 : (Number(r.plan_cost || 0) - realPocketCost);
     const leverage = (capUsd && capUsd > 0) ? Number((capUsd / GOAT_PAID_USD).toFixed(2)) : null;
@@ -1988,6 +2181,7 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
     return {
       ...r,
       model_allowance_usd: capUsd,
+      is_free_model: isFreeModel,
       unmapped_model_allowance: unmappedAllowance,
       credit_burn_per_usd: creditBurnPerUsd,
       credits_consumed: creditsConsumed,
@@ -2168,8 +2362,9 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
       tables: {
         cc_daily_model_usage: counts.daily_rows_count || 0,
         cc_seen_requests: counts.seen_requests_count || 0,
+        cc_request_credits: counts.request_credits_count || 0,
         cc_meta: counts.meta_rows_count || 0,
-        totalRows: (counts.daily_rows_count || 0) + (counts.seen_requests_count || 0) + (counts.meta_rows_count || 0)
+        totalRows: (counts.daily_rows_count || 0) + (counts.seen_requests_count || 0) + (counts.request_credits_count || 0) + (counts.meta_rows_count || 0)
       },
       storage: {
         sizeBytes: dbMeta.size_after || savedLatencies.dbSizeBytes || 0,
@@ -2559,7 +2754,7 @@ function renderDashboardHtml(initialData) {
 
       <div class="card">
         <div class="card-label">
-          <span>Weekly (7-Day) Rolling Limit (<span id="w7dCapLabel">35</span> Credit Cap) <span class="info-tip tip-down" tabindex="0" data-tip="Tracks your 7-day rolling GOAT pool cap in CREDITS of usage-value (NOT API dollars) - worth the full cap on a full-allowance model like GLM-5.2, but only ~1/3.5 of it on GPT-5.6 Sol (3.5 credits per $1). Opens on your first request and resets 7 days later; every new window starts at zero. Extra pay-as-you-go credits never count toward the cap. Used, cap and reset mirror Command Code's own live window state exactly. Bar Color Guide: Solid Green (<60% used, safe) | Solid Amber (60-85% used, moderate) | Solid Red (>=85% used, near weekly cap).">i</span></span>
+          <span>Weekly (7-Day) Rolling Limit (<span id="w7dCapLabel">35</span> Credit Cap) <span class="info-tip tip-down" tabindex="0" data-tip="Tracks your 7-day rolling GOAT pool cap in CREDITS of usage-value (NOT API dollars) - worth the full cap on a full-allowance model like GLM-5.2, but only ~1/3.5 of it on GPT-5.6 Sol (3.5 credits per $1). Opens on your first request and resets 7 days later; every new window starts at zero. Extra pay-as-you-go credits never count toward the cap. Used, cap and reset mirror Command Code's own live window state; a cached snapshot whose reset time has passed renders empty until the next sync. Bar Color Guide: Solid Green (<60% used, safe) | Solid Amber (60-85% used, moderate) | Solid Red (>=85% used, near weekly cap).">i</span></span>
           <span id="w7dReset" style="text-transform:none;">Resets: -</span>
         </div>
         <div class="prog-track"><div class="prog-fill" id="w7dBar" style="width:0%"></div></div>
@@ -3026,15 +3221,25 @@ function renderDashboardHtml(initialData) {
       const b5 = document.getElementById('w5hBar');
       b5.style.width = (w5.usedPct || 0) + '%';
       b5.style.background = barColor(w5.usedPct || 0);
-      document.getElementById('w5hReset').textContent = w5.resetsInMinutes ? ('Resets in ' + Math.floor(w5.resetsInMinutes/60) + 'h ' + (w5.resetsInMinutes%60) + 'm' + (w5.resetsAtIso ? ' - at ' + new Date(w5.resetsAtIso).toLocaleTimeString() : '')) : 'Window idle (5h)';
-      document.getElementById('w5hText').innerHTML = 'Pool Used: <strong>' + (w5.usedCredits||0).toFixed(2) + ' credits</strong> (' + (w5.usedPct||0) + '%) | Left: <strong>' + (w5.leftCredits !== null && w5.leftCredits !== undefined ? w5.leftCredits.toFixed(2) : '-') + '</strong> of ' + (w5.limitCredits || 14) + ' credits' + (w5.windowSource === 'cc-billing-limits' ? ' <span style="opacity:0.75">(live CC window state)</span>' : ' <span style="opacity:0.75">(Sticker value: $' + (w5.stickerValueUsd||0).toFixed(2) + ' | Market-billed: $' + (w5.rawApiUsd||0).toFixed(2) + ')</span>');
+      document.getElementById('w5hReset').textContent = w5.windowExpired
+        ? 'Window reset - awaiting sync'
+        : (w5.resetsInMinutes ? ('Resets in ' + Math.floor(w5.resetsInMinutes/60) + 'h ' + (w5.resetsInMinutes%60) + 'm' + (w5.resetsAtIso ? ' - at ' + new Date(w5.resetsAtIso).toLocaleTimeString() : '')) : 'Window idle (5h)');
+      // A cached window past its resetAt reads 0 until the next sync lands.
+      const windowSourceSuffix = (w) => w.windowExpired
+        ? ' <span style="opacity:0.75">(window reset - awaiting next sync)</span>'
+        : (w.windowSource === 'cc-billing-limits'
+            ? ' <span style="opacity:0.75">(live CC window state)</span>'
+            : ' <span style="opacity:0.75">(Sticker value: $' + (w.stickerValueUsd||0).toFixed(2) + ' | Market-billed: $' + (w.rawApiUsd||0).toFixed(2) + ')</span>');
+      document.getElementById('w5hText').innerHTML = 'Pool Used: <strong>' + (w5.usedCredits||0).toFixed(2) + ' credits</strong> (' + (w5.usedPct||0) + '%) | Left: <strong>' + (w5.leftCredits !== null && w5.leftCredits !== undefined ? w5.leftCredits.toFixed(2) : '-') + '</strong> of ' + (w5.limitCredits || 14) + ' credits' + windowSourceSuffix(w5);
 
       const b7 = document.getElementById('w7dBar');
       b7.style.width = (w7.usedPct || 0) + '%';
       b7.style.background = barColor(w7.usedPct || 0);
-      document.getElementById('w7dReset').textContent = (w7.resetsInMs || w7.resetsInHours) ? ('Resets in ' + fmtResetDuration(w7.resetsInMs ?? (w7.resetsInHours * 3600000)) + (w7.resetsAtIso ? ' - at ' + new Date(w7.resetsAtIso).toLocaleString() : '')) : 'Window idle (7d)';
+      document.getElementById('w7dReset').textContent = w7.windowExpired
+        ? 'Window reset - awaiting sync'
+        : ((w7.resetsInMs || w7.resetsInHours) ? ('Resets in ' + fmtResetDuration(w7.resetsInMs ?? (w7.resetsInHours * 3600000)) + (w7.resetsAtIso ? ' - at ' + new Date(w7.resetsAtIso).toLocaleString() : '')) : 'Window idle (7d)');
       document.getElementById('w7dCapLabel').textContent = w7.limitCredits ?? 35;
-      document.getElementById('w7dText').innerHTML = 'Pool Used: <strong>' + (w7.usedCredits||0).toFixed(2) + ' credits</strong> (' + (w7.usedPct||0) + '%) | Left: <strong>' + (w7.leftCredits !== null && w7.leftCredits !== undefined ? w7.leftCredits.toFixed(2) : '-') + '</strong> of ' + (w7.limitCredits ?? 35) + ' credits' + (w7.windowSource === 'cc-billing-limits' ? ' <span style="opacity:0.75">(live CC window state)</span>' : ' <span style="opacity:0.75">(Sticker value: $' + (w7.stickerValueUsd||0).toFixed(2) + ' | Market-billed: $' + (w7.rawApiUsd||0).toFixed(2) + ')</span>');
+      document.getElementById('w7dText').innerHTML = 'Pool Used: <strong>' + (w7.usedCredits||0).toFixed(2) + ' credits</strong> (' + (w7.usedPct||0) + '%) | Left: <strong>' + (w7.leftCredits !== null && w7.leftCredits !== undefined ? w7.leftCredits.toFixed(2) : '-') + '</strong> of ' + (w7.limitCredits ?? 35) + ' credits' + windowSourceSuffix(w7);
       document.getElementById('w7dAnchor').textContent = w7.windowOpenedAt ? ('Window opened: ' + new Date(w7.windowOpenedAt).toLocaleString() + (w7.windowSource === 'cc-billing-limits' ? ' (CC window anchor)' : ' (first tracked request)')) : '';
       document.getElementById('w7dTop').textContent = Array.isArray(w7.topModels) && w7.topModels.length
         ? ('Top credit consumers' + (w7.windowSource === 'cc-billing-limits' ? ' (this period, per CC)' : '') + ': ' + w7.topModels.slice(0, 5).map(t => t.slug + ' ' + Number(t.credits).toFixed(1) + 'cr').join(' | '))
@@ -3052,8 +3257,15 @@ function renderDashboardHtml(initialData) {
         const newestTxt = cov && cov.newestFetchedIso ? new Date(cov.newestFetchedIso).toLocaleString() : '-';
         const spanHrs = (cov && cov.oldestFetchedIso && cov.newestFetchedIso)
           ? (((new Date(cov.newestFetchedIso) - new Date(cov.oldestFetchedIso)) / 3600000).toFixed(1)) + 'h' : '-';
+        // Snapshot age: a bar that could not be refreshed (dead cookie) must not
+        // look "exact". It is still the last state CC reported, just older.
+        const wlFetchedAt = Number(rw.windowLimitsFetchedAt) || 0;
+        const wlAgeTxt = wlFetchedAt ? (Math.max(0, Math.round((Date.now() - wlFetchedAt) / 60000)) + 'm ago') : '-';
+        const liveTxt = live
+          ? ('Command Code live window state' + (w7.windowExpired ? ' (window reset - awaiting sync)' : ' (exact)') + ' - snapshot fetched ' + wlAgeTxt)
+          : 'local ledger estimate';
         diagEl.innerHTML =
-          'Bar source: <strong>' + (live ? 'Command Code live window state (exact)' : 'local ledger estimate') + '</strong> | ' +
+          'Bar source: <strong>' + escHtml(liveTxt) + '</strong> | ' +
           'Window opened: <strong>' + escHtml(anchorTxt) + '</strong>' + (live ? ' (CC anchor, resets at ' + escHtml(resetTxt) + ')' : '') + ' | ' +
           'Monthly pool: <strong>' + (monthlyPool && monthlyPool.granted ? (Number(monthlyPool.used).toFixed(2) + ' / ' + monthlyPool.granted + ' credits') : '-') + '</strong> | ' +
           'Usage feed: last sync fetched <strong>' + (cov ? (cov.totalFetched ?? 0) : 0) + '</strong> entries in <strong>' + (cov ? (cov.pagesFetched ?? 0) : 0) + '</strong> pages ' +
@@ -3107,6 +3319,7 @@ function renderDashboardHtml(initialData) {
             plan: 0, realPocket: 0, netSav: 0, creditsUsed: 0,
             allowance: r.model_allowance_usd, leverage: r.leverage_multiplier,
             burnPerUsd: r.credit_burn_per_usd,
+            free: Boolean(r.is_free_model),
             unmapped: Boolean(r.unmapped_model_allowance),
             peakNote: r.peak_note || null
           };
@@ -3141,9 +3354,9 @@ function renderDashboardHtml(initialData) {
             const hit = m.inTotal > 0 ? ((m.cached / m.inTotal) * 100).toFixed(1) + '%' : '0%';
             const tot = Math.max(1, m.inTotal + m.out);
             const cP = Math.round((m.cached / tot) * 100), fP = Math.round((m.inFresh / tot) * 100), oP = Math.max(1, 100 - cP - fP);
-            const capTxt = m.unmapped ? 'Unmapped (pool $)' : (m.allowance ? ('$' + m.allowance + ' (' + m.leverage + 'x)') : 'Unmapped');
+            const capTxt = m.free ? 'Free (0 cr)' : (m.unmapped ? 'Unmapped (pool $)' : (m.allowance ? ('$' + m.allowance + ' (' + m.leverage + 'x)') : 'Unmapped'));
             const savTxt = (m.netSav >= 0 ? '+' : '') + fmtUsd(m.netSav);
-            const burnTxt = (m.burnPerUsd !== null && m.burnPerUsd !== undefined) ? (Number(m.burnPerUsd).toFixed(2) + 'x') : '-';
+            const burnTxt = m.free ? 'Free' : ((m.burnPerUsd !== null && m.burnPerUsd !== undefined) ? (Number(m.burnPerUsd).toFixed(2) + 'x') : '-');
             const creditsTxt = Number(m.creditsUsed || 0).toFixed(2) + ' cr';
             return '<tr>' +
               '<td><strong>' + escHtml(m.model) + '</strong><div class="mini-bar"><div class="mini-c" style="width:' + cP + '%"></div><div class="mini-f" style="width:' + fP + '%"></div><div class="mini-o" style="width:' + oP + '%"></div></div></td>' +
@@ -3154,7 +3367,7 @@ function renderDashboardHtml(initialData) {
               '<td>' + fmtNum(m.out) + '</td>' +
               '<td>' + hit + '</td>' +
               '<td><strong>' + fmtUsd(m.plan) + '</strong></td>' +
-              '<td><span class="badge ' + capBadgeClass(m.allowance || 0, false) + '">' + capTxt + '</span></td>' +
+              '<td><span class="badge ' + capBadgeClass(m.allowance || 0, m.free) + '">' + capTxt + '</span></td>' +
               '<td><strong>' + burnTxt + '</strong></td>' +
               '<td><strong>' + creditsTxt + '</strong></td>' +
               '<td>' + fmtUsd(m.realPocket) + '</td>' +
@@ -3181,7 +3394,7 @@ function renderDashboardHtml(initialData) {
         ? '<tr><td colspan="12" style="text-align:center;color:var(--muted);">No date-wise rows for selected range (' + trendPeriod.toUpperCase() + ').</td></tr>'
         : filtered.map(r => {
             const hit = r.tokens_in_total > 0 ? ((r.tokens_cached / r.tokens_in_total) * 100).toFixed(1) + '%' : '0%';
-            const burnTxt = (r.credit_burn_per_usd !== null && r.credit_burn_per_usd !== undefined) ? (Number(r.credit_burn_per_usd).toFixed(2) + 'x') : '-';
+            const burnTxt = r.is_free_model ? 'Free' : ((r.credit_burn_per_usd !== null && r.credit_burn_per_usd !== undefined) ? (Number(r.credit_burn_per_usd).toFixed(2) + 'x') : '-');
             return '<tr><td>' + escHtml(r.usage_date) + '</td><td>' + escHtml(r.model) + '</td><td>' + r.requests_count + '</td><td>' + r.failed_wasted_count + '</td><td>' + fmtNum(r.tokens_in_fresh) + '</td><td>' + fmtNum(r.tokens_cached) + '</td><td>' + fmtNum(r.tokens_out) + '</td><td>' + hit + '</td><td><strong>' + fmtUsd(r.plan_cost) + '</strong></td><td><strong>' + burnTxt + '</strong></td><td><strong>' + Number(r.credits_consumed || 0).toFixed(2) + ' cr</strong></td><td>' + fmtUsd(r.effective_real_usd) + '</td></tr>';
           }).join('');
     }
@@ -3264,7 +3477,7 @@ function renderDashboardHtml(initialData) {
         : 'No sync yet';
       const anchorTxt = w7c.windowOpenedAt ? new Date(w7c.windowOpenedAt).toLocaleString() : '-';
       document.getElementById('sysInfoGrid').innerHTML = [
-        { label: 'D1 Database Row Counts', val: (t.totalRows || 0) + ' rows', sub: 'Daily: ' + (t.cc_daily_model_usage||0) + ' | Seen IDs: ' + (t.cc_seen_requests||0) + ' | Meta: ' + (t.cc_meta||0) },
+        { label: 'D1 Database Row Counts', val: (t.totalRows || 0) + ' rows', sub: 'Daily: ' + (t.cc_daily_model_usage||0) + ' | Ledger: ' + (t.cc_request_credits||0) + ' | Seen: ' + (t.cc_seen_requests||0) + ' | Meta: ' + (t.cc_meta||0) },
         { label: 'D1 Storage Used', val: (st.sizeKb || 0) + ' KB', sub: ((st.sizeKb || 0) / (500 * 1024) * 100).toFixed(4) + '% of 500 MB Free Limit' },
         { label: 'Session Cookie Probe', val: rawData.authProbe ? ('usage ' + (rawData.authProbe.usageStatus ?? '-') + ' | window ' + (rawData.authProbe.windowStatus ?? '-') + ' (' + (rawData.authProbe.windowSource || 'n/a') + ')') : 'No sync yet', sub: rawData.authProbe ? (authProbeText(rawData.authProbe) + ' | ' + new Date(rawData.authProbe.ts).toLocaleString()) : 'Run Manual Refresh once' },
         { label: 'Usage & Summary API Latency', val: (lat.usageApiMs || 0) + ' ms', sub: 'Summary API: ' + (lat.summaryApiMs || 0) + ' ms' },
