@@ -1,0 +1,2 @@
+# Health script configs (only the .example templates are committed)
+scripts/**/*.env

@@ -78,9 +78,32 @@ homelab-dashboard/
 ├── wrangler.toml        # Worker name, cron, D1 binding (only needed if you deploy with wrangler)
 ├── package.json         # npm scripts (dev / deploy / db:init)
 ├── .dev.vars.example    # Template for local secrets (copy to .dev.vars, never commit)
+├── scripts/
+│   ├── pi5/
+│   │   ├── health.sh                        # Pi5 health JSON/CLI (deployed as ~/scripts/health.sh)
+│   │   └── env_files/health.env.example     # → ~/scripts/env_files/health.env
+│   └── vm/
+│       ├── vm_health.sh                     # VM health JSON/CLI (deployed as ~/vm_health.sh)
+│       └── env_files/vm_health.env.example  # → ~/env_files/vm_health.env
 ├── LICENSE              # MIT
 └── README.md            # This file
 ```
+
+## Node health scripts
+
+The scripts in `scripts/` are byte-for-byte the copies running on the hosts. Everything host-specific
+(disk serials, tunnel IPs, the IPv6 resolver, the Worker secret) lives in an `env_files/` folder next to
+each script, which is git-ignored; only the `.example` templates are committed. Each script reads
+`env_files/<name>.env` relative to its own location, or the path in `$HEALTH_CONFIG` if set.
+
+| Host | Script | Config | Served by |
+|---|---|---|---|
+| Pi5 | `~/scripts/health.sh --json` | `~/scripts/env_files/health.env` | `pi-health-api.service` (socat, port 2000) behind a Cloudflare Tunnel |
+| VM1–4 | `~/vm_health.sh --api` | `~/env_files/vm_health.env` | `vm-health-api.service` (socat, port 2000), checks `x-worker-secret` |
+
+Deploying a change: copy the script to the host, keep the config folder untouched, and check the
+output with `jq` (`health.sh --json | jq .`, or pipe a request into `vm_health.sh --api`). Keep the
+config files at mode `600`. Without `WORKER_SECRET` the VM script answers 403 to every request.
 
 ## Deploying without wrangler
 
