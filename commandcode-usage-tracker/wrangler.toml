@@ -9,7 +9,7 @@ crons = ["*/15 * * * *"]
 
 # D1 database binding (create first, then paste the database_id)
 #   wrangler d1 create cc-usage-db
-#   wrangler d1 execute cc-usage-db --file=./schema.sql
+#   wrangler d1 execute cc-usage-db --remote --file=./schema.sql
 [[d1_databases]]
 binding = "DB"
 database_name = "cc-usage-db"

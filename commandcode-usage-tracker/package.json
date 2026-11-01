@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:init": "wrangler d1 execute cc-usage-db --file=./schema.sql"
+    "db:init": "wrangler d1 execute cc-usage-db --remote --file=./schema.sql",
+    "db:init:local": "wrangler d1 execute cc-usage-db --local --file=./schema.sql"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"
