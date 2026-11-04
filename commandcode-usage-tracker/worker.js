@@ -33,6 +33,10 @@
 // 6. Dismissible Top Alerts with 24-Hour Snooze (Synced in D1 across Laptop & Mobile)
 // 7. Manual Refresh Modal (ADMIN_USER + ADMIN_PASS secrets, 2 Force Checkboxes, Cookie Fallback, Bookmarklet)
 // 8. Viewport-Clamped Hover/Tap Info Tooltips with Complete Color & Gradient Explanations
+// 2026-11-04:
+// - The derived [UNMAPPED] banner line now has an alert key (tied to the exact
+//   unmapped model set) and honours Dismiss 24h / Dismiss All. Its text no
+//   longer implies a force-fetch always fixes it.
 // DEPLOYED BUILD (2026-11-02 plan-aware pass):
 // - PLAN-AWARE: the tracker is no longer GOAT-only. Every plan's credit windows
 //   (Go 3/6, GOAT 14/35, Pro 16/40 ...), monthly pool and price are parsed from
@@ -2200,7 +2204,11 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
     .filter(e => !dismissedMap[e.alertKey] || dismissedMap[e.alertKey] <= nowMs);
   const unmappedModels = [...new Set((lookupWarnings || [])
     .filter(e => e.source === "MISSING_MODEL_CATALOG")
-    .map(e => e.model))];
+    .map(e => e.model))].sort();
+  // The banner's UNMAPPED line is derived per load, so it carries its own key
+  // (tied to the exact model set) and honours the same 24h dismissal map.
+  const unmappedAlertKey = unmappedModels.length ? `UNMAPPED:${unmappedModels.join(",").slice(0, 120)}` : null;
+  const unmappedAlertDismissed = Boolean(unmappedAlertKey && dismissedMap[unmappedAlertKey] && dismissedMap[unmappedAlertKey] > nowMs);
 
   const lastSyncTs = Number(metaMap.last_sync_ts || 0);
   const dbSizeBytes = savedLatencies.dbSizeBytes || 0;
@@ -2213,6 +2221,8 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
     lastPushStatus: metaMap.last_push_status || null,
     alerts: activeAlerts,
     unmappedModels,
+    unmappedAlertKey,
+    unmappedAlertDismissed,
     rollingWindows,
     lastSyncCoverage,
     authProbe,
@@ -2955,12 +2965,15 @@ function renderDashboardHtml(initialData) {
         }
         adminCreds = creds;
         rawData.alerts = (rawData.alerts || []).filter(a => !alertKeys.includes(a.alertKey));
+        if (rawData.unmappedAlertKey && alertKeys.includes(rawData.unmappedAlertKey)) rawData.unmappedAlertDismissed = true;
         renderHeaderAndAlerts();
       } catch (_) {}
     }
     function dismissAlert(alertKey) { return dismissAlerts([alertKey]); }
     function dismissAllAlerts() {
-      return dismissAlerts((rawData.alerts || []).map(a => a.alertKey).filter(Boolean));
+      const keys = (rawData.alerts || []).map(a => a.alertKey);
+      if (rawData.unmappedAlertKey && !rawData.unmappedAlertDismissed) keys.push(rawData.unmappedAlertKey);
+      return dismissAlerts(keys.filter(Boolean));
     }
 
     function sortCatalog(key) {
@@ -3063,8 +3076,8 @@ function renderDashboardHtml(initialData) {
       // Unmapped models burn at the 1x pool fallback, which UNDER-reads vs CC if
       // their real cap is lower - surface as an informational (non-error) line.
       const unmapped = Array.isArray(rawData.unmappedModels) ? rawData.unmappedModels : [];
-      const infoLines = unmapped.length > 0
-        ? [{ source: 'UNMAPPED', message: 'Unmapped models burn at 1.00x pool fallback (may under-read vs CC): ' + unmapped.join(', ') + '. Force-fetch the plan model list to map them.' }]
+      const infoLines = (unmapped.length > 0 && !rawData.unmappedAlertDismissed)
+        ? [{ source: 'UNMAPPED', alertKey: rawData.unmappedAlertKey, message: 'Not in the plan model list, so credits use the 1.00x pool fallback: ' + unmapped.join(', ') + '. Force-fetch only helps if the docs list them; otherwise these are off-plan models.' }]
         : [];
       const allLines = alerts.concat(infoLines);
       if (allLines.length > 0) {
