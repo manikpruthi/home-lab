@@ -35,7 +35,8 @@ const ONE_SHOT_ALERT = /ARM instance grabbed/i;  // notified once, never re-remi
 const FETCH_TIMEOUT_MS = 12000;
 const STALE_MS = 20 * 60 * 1000;          // page load refreshes in background past this age
 const REMIND_MS = 6 * 60 * 60 * 1000;     // Slack re-reminds about unchanged active alerts
-const IPV6_HISTORY_POINTS = 480;
+const IPV6_WINDOW_S = 24 * 60 * 60;      // sparkline window; matches uptime-monitor's retention and the "24h" label
+const IPV6_STALE_S = 15 * 60;            // uptime-monitor runs every 5 min, so 3 missed runs = stale
 
 const JSON_HEADERS = {
   'Content-Type': 'application/json',
@@ -167,6 +168,37 @@ function collectAlerts(data, hosts, mutes) {
   return out;
 }
 
+// The uptime-monitor Worker's 'ipv6_data' row, trimmed to the sparkline window.
+// Stale only when the row exists, so a setup without uptime-monitor shows no alert.
+function ipv6Monitor(raw, nowS) {
+  const doc = raw && typeof raw === 'object' ? raw : null;
+  const history = (Array.isArray(doc?.history) ? doc.history : []).filter(h => h && h.time > nowS - IPV6_WINDOW_S);
+  const lastCheck = Number.isFinite(doc?.last_check) ? doc.last_check : (doc?.history?.at(-1)?.time ?? null);
+  return {
+    state: doc?.state || 'unknown',
+    since: Number.isFinite(doc?.since) ? doc.since : null,
+    last_check: lastCheck,
+    stale: !!doc && (!Number.isFinite(lastCheck) || nowS - lastCheck > IPV6_STALE_S),
+    history
+  };
+}
+
+const fmtAge = s => (s < 3600 ? `${Math.max(1, Math.round(s / 60))} min` : `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`);
+
+// Page-only alert for the Global Alerts card. Not part of collectAlerts, so the
+// dashboard's Slack never duplicates the uptime-monitor's own IPv6 alerts.
+function ipv6Alerts(mon, mutes, nowS) {
+  let text = null;
+  if (mon.stale) {
+    text = Number.isFinite(mon.last_check)
+      ? `IPv6 monitor stale (no check for ${fmtAge(nowS - mon.last_check)})`
+      : 'IPv6 monitor stale (no checks recorded)';
+  } else if (mon.state === 'down') {
+    text = 'IPv6 unreachable from Cloudflare edge' + (Number.isFinite(mon.since) ? ` for ${fmtAge(nowS - mon.since)}` : '');
+  }
+  return text ? [{ host: 'Pi5', text, cat: 'network', muted: !!mutes.network }] : [];
+}
+
 // Numbers are stripped from the dedupe key so "RAM (86%)" -> "RAM (87%)" isn't a new alert.
 const alertKey = a => `${a.host}: ${a.text}`.toLowerCase().replace(/\d+(\.\d+)?/g, '#');
 
@@ -255,15 +287,13 @@ export default {
         }
       }
 
-      const ipv6 = store.ipv6_data || { state: 'unknown', history: [] };
+      const nowS = Math.floor(Date.now() / 1000);
+      const ipv6 = ipv6Monitor(store.ipv6_data, nowS);
       const body = {
         ...data,
-        pi5: {
-          ...(data.pi5 || {}),
-          ipv6_monitor: { state: ipv6.state, history: (ipv6.history || []).slice(-IPV6_HISTORY_POINTS) }
-        },
+        pi5: { ...(data.pi5 || {}), ipv6_monitor: ipv6 },
         _mutes: mutes,
-        _alerts: collectAlerts(data, hosts, mutes),
+        _alerts: [...collectAlerts(data, hosts, mutes), ...ipv6Alerts(ipv6, mutes, nowS)],
         _vms: VM_DEFS.map(v => v.id)
       };
       return json(body);
@@ -585,7 +615,7 @@ function clientMain() {
 
     // Network
     const ipv6Mon = pi5.ipv6_monitor;
-    const isIpv6MonErr = !!(ipv6Mon && ipv6Mon.history && ipv6Mon.history.length && ipv6Mon.state !== 'up');
+    const isIpv6MonErr = !!(ipv6Mon && (ipv6Mon.stale || (ipv6Mon.history && ipv6Mon.history.length && ipv6Mon.state !== 'up')));
     const vmTunnels = ['oci_vm1', 'oci_vm2', 'oci_vm3', 'oci_vm4'];
     const isTunnelErr = vmTunnels.some(k => net[k] && !tunnelUp(net[k]));
     const isDnsErr = net.dns4 !== '✓' || net.dns6 !== '✓';
@@ -603,9 +633,13 @@ function clientMain() {
         const t = esc(ist.format(new Date(h.time * 1000)));
         return '<div class="spark-bar ' + (h.status === 1 ? 'up' : 'down') + '" title="' + t + '" data-act="spark" data-arg="' + t + '"></div>';
       }).join('');
-      ipv6Html = row('IPv6 Status (24h)', esc((ipv6Mon.state || 'unknown').toUpperCase()), ipv6Mon.state === 'up' ? 'ok' : 'err') +
+      const ipv6Label = ipv6Mon.stale ? 'STALE' : (ipv6Mon.state || 'unknown').toUpperCase();
+      const ipv6Hint = ipv6Mon.stale
+        ? 'Last check ' + fmtTime(ipv6Mon.last_check ? ipv6Mon.last_check * 1000 : null) + ' · tap graph for times'
+        : ipv6Mon.since ? ipv6Label + ' since ' + fmtTime(ipv6Mon.since * 1000) + ' · tap graph for times' : 'Tap graph to view time';
+      ipv6Html = row('IPv6 Status (24h)', esc(ipv6Label), !ipv6Mon.stale && ipv6Mon.state === 'up' ? 'ok' : 'err') +
         '<div id="ipv6-scroll" style="width: 100%; overflow-x: auto; margin-bottom: 4px; border-radius: 3px;"><div class="sparkline">' + bars + '</div></div>' +
-        '<div id="ipv6-spark-time" class="spark-time-display">Tap graph to view time</div>';
+        '<div id="ipv6-spark-time" class="spark-time-display">' + esc(ipv6Hint) + '</div>';
     }
 
     const memVal = '<span style="display:flex; flex-direction:column; align-items:flex-end;"><span>' + renderTrend(pi5._trends?.ram, ramPct, '%') +
