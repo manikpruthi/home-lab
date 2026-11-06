@@ -1,11 +1,13 @@
 # Local dev secrets — copy to `.dev.vars` and fill in. NEVER commit `.dev.vars`.
 # Production values go in: Cloudflare Dashboard → Worker → Settings → Variables and Secrets.
 
-# Endpoint probed on every run. Expects a fast 200 (e.g. an IPv6-only liveness port).
+# Endpoint probed on every run (required). Expects a fast 2xx/3xx (e.g. an IPv6-only liveness port).
+# Use an IPv6 literal or a hostname with only an AAAA record so the probe can't fall back to IPv4.
 PI_IPV6_URL=
 
 # InfluxDB v2 write endpoint, WITHOUT the precision parameter
-# (the Worker appends ?precision=s or &precision=s as needed)
+# (the Worker appends ?precision=s or &precision=s as needed).
+# Leave INFLUX_URL or INFLUX_TOKEN blank to skip InfluxDB entirely.
 INFLUX_URL=
 
 # InfluxDB API token with write access to the target bucket
@@ -17,3 +19,10 @@ INFLUX_SECRET=
 
 # Slack incoming webhook URL. Leave blank to disable alerting.
 SLACK_WEBHOOK=
+
+# Enables manual runs: POST /run with "Authorization: Bearer <RUN_SECRET>".
+# Leave blank to disable them (GET / stays a read-only status page).
+RUN_SECRET=
+
+# Consecutive failed runs before the state flips to down and Slack is alerted (default 2).
+DOWN_AFTER_RUNS=

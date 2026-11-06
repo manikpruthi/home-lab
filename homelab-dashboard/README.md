@@ -16,8 +16,13 @@ aggregates them at the edge, and Slack gets the alerts.
   boot show amber, not red.
 - **Trend tails** — the last five temperature / RAM / CPU-steal samples are kept and rendered inline
   with a colour hint against the recent average.
-- **24-hour IPv6 sparkline** — 480 bars read from the `ipv6_data` row that the companion
-  `uptime-monitor` Worker writes into the same database.
+- **24-hour IPv6 sparkline** — one bar per check (288 at the monitor's `*/5` cadence) from the
+  `ipv6_data` row that the companion `uptime-monitor` Worker writes into the same database, cut to the
+  last 24 hours by timestamp. The row shows `UP`/`DOWN` with the time the state began, or `STALE` when
+  the monitor hasn't checked for 15 minutes.
+- **IPv6 in Global Alerts** — a confirmed IPv6 outage, or a stale monitor, adds a `network` alert to
+  the Global Alerts card and turns the status dot red. It is page-only: the uptime-monitor sends its own
+  Slack alerts, so the dashboard never posts a duplicate.
 - **Stale-while-revalidate** — `/api/data` always answers from the cached snapshot; when any host's
   last poll is older than 20 minutes it kicks off a background refresh (`ctx.waitUntil`), deduplicated
   per isolate so concurrent viewers don't stampede the hosts.
@@ -26,7 +31,8 @@ aggregates them at the edge, and Slack gets the alerts.
   of its stale cached alerts.
 - **Per-category mute** — each alert is assigned exactly one category (global, network, storage,
   services, compute) by word-boundary rules. Muted alerts are kept off Slack and shown dimmed with 🔕 in
-  the Global Alerts card. Persisted in D1 so the setting is shared across devices.
+  the Global Alerts card. Persisted in D1 so the setting is shared across devices. `uptime-monitor`
+  reads the same `mute_prefs` row: muting `network` also silences its IPv6 Slack alerts.
 - **Change-based Slack** — only the cron run posts. It sends new and resolved alerts, then a reminder of
   still-active alerts every 6 hours. Numbers are ignored when comparing, so `RAM (86%)` → `RAM (87%)` is
   not a new alert. "ARM instance grabbed" is notified once and never re-reminded.
@@ -49,9 +55,9 @@ aggregates them at the edge, and Slack gets the alerts.
                      ┌──────────────────────┐
                      │ D1 `store`           │
                      │ dashboard_data       │ ← this Worker
-                     │ mute_prefs           │ ← this Worker
+                     │ mute_prefs           │ ← this Worker (also read by uptime-monitor)
                      │ alert_state          │ ← this Worker (Slack dedupe)
-                     │ ipv6_data            │ ← uptime-monitor
+                     │ ipv6_data            │ ← uptime-monitor (+ ipv6_influx_queue)
                      └──────────┬───────────┘
                                 v
                     GET /  → server-rendered HTML
@@ -61,8 +67,9 @@ aggregates them at the edge, and Slack gets the alerts.
                   Slack (cron only, on change + 6h reminder)
 ```
 
-The database is **shared** with `uptime-monitor`. That Worker owns the `ipv6_data` row; this one owns
-`dashboard_data`, `mute_prefs` and `alert_state`. Both bind to the same `HEALTH_DB`.
+The database is **shared** with `uptime-monitor`. That Worker owns the `ipv6_data` and
+`ipv6_influx_queue` rows; this one owns `dashboard_data`, `mute_prefs` and `alert_state`. Both bind to
+the same `HEALTH_DB`.
 
 Per poll: fetch the requested targets in parallel (a payload without a `system` object counts as a
 failure) → read the stored snapshot, mute prefs and alert state in one query → merge and recompute the
@@ -186,7 +193,7 @@ journal lines and process names can't produce invalid JSON. Fields the UI reads 
 | Method & path | Auth | Description |
 |---|---|---|
 | `GET /` | — | Dashboard HTML (no-store) |
-| `GET /api/data` | — | Cached snapshot + `ipv6_monitor` (last 480 points) + `_mutes` + `_alerts` (categorised, with `muted` flag); refreshes in the background if stale |
+| `GET /api/data` | — | Cached snapshot + `ipv6_monitor` (`state`, `since`, `last_check`, `stale`, last 24 h of `history`) + `_mutes` + `_alerts` (categorised, with `muted` flag; includes the IPv6 alert); refreshes in the background if stale |
 | `GET /api/data?force=all\|pi5\|vms` | admin | Forces a live poll for that target set (no Slack); any other value is a 400 |
 | `POST /api/mute` | admin | Toggles a category mute; body `{ "category": "global\|compute\|storage\|network\|services" }`; unknown category is a 400 |
 

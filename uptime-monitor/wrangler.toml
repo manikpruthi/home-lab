@@ -3,14 +3,15 @@ name = "uptime-monitor"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
-# Probe cadence. 480 history points are retained in D1, so at */5 that is 40 hours of history.
-# Adjust to match how much history you want to keep.
+# Probe cadence. History is kept for 24 hours by timestamp whatever the cadence (288 points at */5).
+# homelab-dashboard marks the data stale after 15 minutes without a check, so keep this at */5 or faster.
 [triggers]
 crons = ["*/5 * * * *"]
 
 # D1 database binding. This is the SAME database the homelab-dashboard Worker
 # reads: this Worker owns the `ipv6_data` row that the dashboard renders as its
-# IPv6 sparkline. Use one database_id for both Workers.
+# IPv6 sparkline (plus `ipv6_influx_queue`), and reads the dashboard's
+# `mute_prefs`. Use one database_id for both Workers.
 #   wrangler d1 create homelab-health-db
 #   wrangler d1 execute homelab-health-db --file=./schema.sql
 [[d1_databases]]
