@@ -8,6 +8,9 @@ behind an NFC tag — tap the sticker, land on this page, join the Wi-Fi.
 
 - **One-scan join** — renders a `WIFI:S:<ssid>;T:WPA;P:<pass>;;` QR code, which iOS and Android both
   recognise natively. No app, no captive portal.
+- **iOS Safari hand-off** — on iPhone/iPad, only Safari offers *Join* on a long-pressed Wi-Fi QR.
+  When the page opens in another iOS browser (Chrome, Firefox, Edge, in-app browsers…), it tries once
+  to reopen itself in Safari via `x-safari-https://` and shows an **Open in Safari** button as a fallback.
 - **Tap to copy** — network name, password, and address copy to the clipboard with a toast
   confirmation; the password stays masked on screen.
 - **Read-only extras** — Bluetooth speaker name, and a WhatsApp deep link for contacting the host.
@@ -33,11 +36,38 @@ behind an NFC tag — tap the sticker, land on this page, join the Wi-Fi.
 
 The Worker has no database, no cron, and no state — every request re-renders from `env`.
 
+## NFC tag setup
+
+One tag serves both platforms. Write **two NDEF records**, in this order:
+
+| # | Record | Who acts on it |
+|---|---|---|
+| 1 | Wi-Fi network (`application/vnd.wfa.wsc`, SSID + password) | Android joins directly; iOS ignores it |
+| 2 | URI → `https://<your-worker-host>/` | iOS opens the page; Android ignores it (it only acts on the first record) |
+
+Guest flow:
+
+- **Android** — tap the tag, the phone joins the network. The page is never opened.
+- **iOS, default browser Safari** — tap the tag, open the notification, long-press the QR code, choose
+  **Join**.
+- **iOS, other default browser** — tap the tag, the page opens in that browser, then reopens in Safari
+  (automatically, or via the **Open in Safari** button). Continue as above.
+
+### Limitations
+
+- iOS has no web API to join Wi-Fi, so a single tap that joins on iOS isn't possible from a web page.
+  The QR long-press in Safari is the shortest path.
+- The tag's URI record can't use `x-safari-https://`. iOS background NFC reading only handles
+  standard schemes such as `https://`, so the URL always opens in the default browser first.
+- `x-safari-https://` needs iOS 17 or later. Some browsers block the automatic redirect without a tap
+  or ask for confirmation first. The button covers that case. On older iOS the button does nothing,
+  so guests can copy the network name and password instead.
+
 ## Project structure
 
 ```text
 welcome-home-worker/
-├── worker.js            # The entire Worker: HTML + styles + copy handler
+├── worker.js            # The entire Worker: HTML + styles + copy handler + Safari hand-off
 ├── wrangler.toml        # Worker name and compatibility date
 ├── package.json         # npm scripts (dev / deploy)
 ├── .dev.vars.example    # Template for local secrets (copy to .dev.vars, never commit)

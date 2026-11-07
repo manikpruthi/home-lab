@@ -73,6 +73,28 @@ export default {
         .value { font-weight: 600; font-family: monospace; font-size: 1.1rem; text-align: left; }
         .address-value { font-size: 0.9rem; word-break: break-word; line-height: 1.2; }
         .footer { margin-top: 15px; font-size: 0.7rem; opacity: 0.5; }
+        .safari-banner {
+            display: none;
+            background: var(--accent);
+            color: white;
+            border-radius: 16px;
+            padding: 14px 16px;
+            margin-bottom: 20px;
+            text-align: left;
+            font-size: 0.85rem;
+            line-height: 1.35;
+        }
+        .safari-banner a {
+            display: block;
+            margin-top: 10px;
+            background: white;
+            color: #0f172a;
+            text-align: center;
+            padding: 10px;
+            border-radius: 10px;
+            font-weight: 600;
+            text-decoration: none;
+        }
         .toast {
             position: fixed;
             bottom: 30px;
@@ -92,6 +114,11 @@ export default {
     <div class="card">
         <h1>Welcome Home</h1>
         <p class="subtitle">Scan to join or tap to copy</p>
+
+        <div id="safari-banner" class="safari-banner">
+            To join with one tap, open this page in Safari, then long-press the QR code and choose <b>Join</b>.
+            <a id="safari-link" href="#">Open in Safari</a>
+        </div>
 
         <div class="qr-container">
             <img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=WIFI:S:${env.WIFI_SSID};T:WPA;P:${env.WIFI_PASS};;" alt="WiFi QR Code">
@@ -144,6 +171,29 @@ export default {
     <div id="toast" class="toast">Copied to clipboard!</div>
 
     <script>
+        // iOS opens NFC/link URLs in the default browser. Only Safari offers
+        // "Join network" on a long-pressed Wi-Fi QR, so hand other iOS browsers
+        // over to Safari via the x-safari-https:// scheme (iOS 17+).
+        (function () {
+            const ua = navigator.userAgent;
+            const isIOS = /iPhone|iPad|iPod/.test(ua) ||
+                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+            const notSafari = /CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo|Brave|GSA|Instagram|FBAN|FBAV/.test(ua);
+            if (!isIOS || !notSafari) return;
+
+            const safariUrl = 'x-safari-' + location.href;
+            document.getElementById('safari-link').href = safariUrl;
+            document.getElementById('safari-banner').style.display = 'block';
+
+            // Try once automatically; browsers that need a tap keep the button.
+            try {
+                if (!sessionStorage.getItem('safariHandoff')) {
+                    sessionStorage.setItem('safariHandoff', '1');
+                    location.href = safariUrl;
+                }
+            } catch (e) { /* storage blocked: the button still works */ }
+        })();
+
         async function copyToClipboard(text, label) {
             try {
                 await navigator.clipboard.writeText(text);
