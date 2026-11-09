@@ -3,9 +3,10 @@ name = "commandcode-usage-tracker"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
-# 15-minute background sync (matches the Worker's CACHE_TTL_MS)
+# Fires every minute; the Worker only syncs when its adaptive due time has passed
+# (every 1-5 min depending on request rate), otherwise a run is one D1 read.
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["* * * * *"]
 
 # D1 database binding (create first, then paste the database_id)
 #   wrangler d1 create cc-usage-db

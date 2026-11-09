@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS cc_daily_model_usage (
   -- -1 means "row predates credit freezing"; the Worker derives it from the
   -- current catalog instead. New rows always store a real value (>= 0).
   credits_consumed REAL DEFAULT -1,
+  -- Requests added by gap reconciliation (included in requests_count).
+  reconciled_requests INTEGER DEFAULT 0,
   PRIMARY KEY (usage_date, model)
 );
 
@@ -43,6 +45,29 @@ CREATE TABLE IF NOT EXISTS cc_request_credits (
   credit_weight REAL,
   credits REAL,
   observed_at INTEGER
+);
+
+-- Hour-of-day rollup (IST) behind the dashboard's time filter. Same metrics as
+-- cc_daily_model_usage, one row per (date, hour, model). reconciled_requests counts
+-- requests the usage feed never served (added from CC's per-model totals with
+-- estimated tokens/cost) - see "Gap reconciliation" in the README.
+CREATE TABLE IF NOT EXISTS cc_hourly_model_usage (
+  usage_date TEXT NOT NULL,
+  usage_hour INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  requests_count INTEGER DEFAULT 0,
+  failed_wasted_count INTEGER DEFAULT 0,
+  tokens_in_total INTEGER DEFAULT 0,
+  tokens_in_fresh INTEGER DEFAULT 0,
+  tokens_cached INTEGER DEFAULT 0,
+  tokens_out INTEGER DEFAULT 0,
+  plan_cost REAL DEFAULT 0,
+  input_cost REAL DEFAULT 0,
+  cache_cost REAL DEFAULT 0,
+  output_cost REAL DEFAULT 0,
+  credits_consumed REAL DEFAULT 0,
+  reconciled_requests INTEGER DEFAULT 0,
+  PRIMARY KEY (usage_date, usage_hour, model)
 );
 
 CREATE TABLE IF NOT EXISTS cc_meta (
@@ -81,6 +106,31 @@ CREATE INDEX IF NOT EXISTS idx_request_credits_created ON cc_request_credits(cre
 -- (cc_request_credits is the dedupe ledger). Drop it to reclaim the space:
 --
 -- 4) DROP TABLE IF EXISTS cc_seen_requests;
+--
+-- 2026-11-09 time filter + gap reconciliation build: run 5) and 6) BEFORE deploying
+-- it (ingest writes both). Existing history is backfilled into the hourly table
+-- automatically on the first sync after deploy.
+--
+-- 5) ALTER TABLE cc_daily_model_usage ADD COLUMN reconciled_requests INTEGER DEFAULT 0;
+--
+-- 6) CREATE TABLE IF NOT EXISTS cc_hourly_model_usage (
+--      usage_date TEXT NOT NULL,
+--      usage_hour INTEGER NOT NULL,
+--      model TEXT NOT NULL,
+--      requests_count INTEGER DEFAULT 0,
+--      failed_wasted_count INTEGER DEFAULT 0,
+--      tokens_in_total INTEGER DEFAULT 0,
+--      tokens_in_fresh INTEGER DEFAULT 0,
+--      tokens_cached INTEGER DEFAULT 0,
+--      tokens_out INTEGER DEFAULT 0,
+--      plan_cost REAL DEFAULT 0,
+--      input_cost REAL DEFAULT 0,
+--      cache_cost REAL DEFAULT 0,
+--      output_cost REAL DEFAULT 0,
+--      credits_consumed REAL DEFAULT 0,
+--      reconciled_requests INTEGER DEFAULT 0,
+--      PRIMARY KEY (usage_date, usage_hour, model)
+--    );
 --
 -- Obsolete meta keys (old rolling ledger blob, inheritance flags, GOAT-only caps,
 -- OpenRouter sync stamps) are deleted by the Worker's daily retention pass.

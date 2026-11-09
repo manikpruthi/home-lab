@@ -37,6 +37,18 @@
 // - The derived [UNMAPPED] banner line now has an alert key (tied to the exact
 //   unmapped model set) and honours Dismiss 24h / Dismiss All. Its text no
 //   longer implies a force-fetch always fixes it.
+// BUILD (2026-11-09 time filter + gap reconciliation pass):
+// - MODEL API IDs: the docs link slug is not always the billing id ("Tencent Hy3"
+//   links /models/tencent-hy3 but bills as tencent/hy3-paid -> feed slug hy3-paid,
+//   flagged [UNMAPPED] on the 1x fallback). parsePlanTablesHtml now reads the
+//   page's embedded slug -> id list (extractDocApiIds) into catalog apiId.
+// - ADAPTIVE POLLING: cron every minute, sync only when next_sync_due_ts passed;
+//   the interval (1-5 min) targets ~40 new requests per 100-entry feed page.
+// - GAP RECONCILIATION: reconcileFeedGaps books requests the feed dropped from
+//   /internal/usage/by-model deltas (estimated tokens/cost, reconciled_requests).
+// - TIME FILTER: cc_hourly_model_usage (IST hours), one-time exact backfill from
+//   the 8-day ledger (ensureHourlyBackfill), older days estimated on the page
+//   from the user's hour-of-day profile.
 // DEPLOYED BUILD (2026-11-02 plan-aware pass):
 // - PLAN-AWARE: the tracker is no longer GOAT-only. Every plan's credit windows
 //   (Go 3/6, GOAT 14/35, Pro 16/40 ...), monthly pool and price are parsed from
@@ -192,12 +204,25 @@ const LEGACY_MODEL_ALIASES = {};
 // static pasted copy goes stale fast - captureSessionCookieRotation() keeps the
 // stored copy current from Set-Cookie response headers.
 const SESSION_COOKIE_NAME = "__Secure-commandcode_prod_.session_token";
-const CACHE_TTL_MS = 15 * 60 * 1000;            // 15 minutes usage auto-refresh TTL (matches 15m Cron)
+const CACHE_TTL_MS = 15 * 60 * 1000;            // Page-load sync TTL fallback when no adaptive due time is stored
+// Adaptive feed polling. The usage feed only ever serves the newest 100 requests
+// with no pagination, so the only way to never lose one is to poll before 100
+// pile up. The cron fires every minute (wrangler.toml) but a run is a single
+// meta read unless a sync is due; the due time is re-planned after every sync
+// from the observed request rate so the next poll lands at ~FEED_TARGET_FILL
+// new requests: idle -> every SYNC_MAX_INTERVAL_MS, heavy agent bursts -> every
+// minute. Whatever still slips through is reconciled (reconcileFeedGaps).
+const FEED_TARGET_FILL = 40;
+const SYNC_MIN_INTERVAL_MS = 60 * 1000;
+const SYNC_MAX_INTERVAL_MS = 5 * 60 * 1000;
+// Re-baseline the reconciliation counters this often (must stay inside the
+// 8-day ledger, which is what the tracker side of the comparison is counted from).
+const RECON_REBASE_MS = 4 * 24 * 60 * 60 * 1000;
 const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;     // 24 hours pricing/catalog & alert snooze TTL
 // Bump when the catalog parser changes shape (keys, ids, caps). One sync after a
 // deploy re-scrapes the docs regardless of the 10 AM IST rule, so a cached catalog
 // written by an older parser can't keep mis-pricing models for a day.
-const CATALOG_SCHEMA_VERSION = "2026-11-02-plan-aware";
+const CATALOG_SCHEMA_VERSION = "2026-11-09-api-ids";
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;       // 5-hour rolling window
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;  // 7-day weekly rolling window
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;     // UTC+05:30 (India Standard Time)
@@ -206,7 +231,7 @@ const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;     // UTC+05:30 (India Standard Tim
 const PROCESSING_FEE_RATE = 0.078;
 const DEFAULT_PLAN_KEY = "goat";                // Used until the plan can be detected
 const USAGE_FEED_LIMIT = 100;                   // /internal/usage hard-caps limit at 100 (limit > 100 => HTTP 400)
-const STATEMENTS_PER_REQUEST = 2;               // ledger insert + daily rollup upsert
+const STATEMENTS_PER_REQUEST = 3;               // ledger insert + daily rollup upsert + hourly rollup upsert
 // D1 caps a batch at 100 statements; keep it a multiple of STATEMENTS_PER_REQUEST
 // so one request's ledger row and rollup upsert always commit together.
 const INGEST_BATCH_SIZE = Math.floor(100 / STATEMENTS_PER_REQUEST) * STATEMENTS_PER_REQUEST;
@@ -228,7 +253,7 @@ const DASHBOARD_META_KEYS = [
   "billing_summary_json", "dismissed_alerts_json", "sync_errors_json",
   "last_sync_ts", "last_sync_status", "last_latencies_json", "last_sync_coverage_json",
   "last_auth_probe_json", "last_catalog_sync_ts", "table_counts_json",
-  "last_push_ts", "last_push_status"
+  "last_push_ts", "last_push_status", "hourly_exact_from", "next_sync_due_ts"
 ];
 // Meta keys written by earlier builds that nothing reads any more; the daily
 // retention pass deletes them.
@@ -315,19 +340,24 @@ async function releaseSyncLease(db, leaseToken) {
 // Decides whether a GET handler should kick off a sync. The retry floor keeps a dead
 // cookie from triggering a fresh API call on every single page load.
 async function getSyncTriggerState(db) {
-  const meta = await getMetaMany(db, ["last_sync_ts", "last_sync_attempt_ts"]);
+  const meta = await getMetaMany(db, ["last_sync_ts", "last_sync_attempt_ts", "next_sync_due_ts"]);
   const lastSync = Number(meta.last_sync_ts) || 0;
   const lastAttempt = Number(meta.last_sync_attempt_ts) || 0;
+  const nextDue = Number(meta.next_sync_due_ts) || 0;
   const ageMs = lastSync ? Date.now() - lastSync : 0;
-  const due = lastSync === 0 || ageMs >= CACHE_TTL_MS;
+  const due = lastSync === 0 || (nextDue > 0 ? Date.now() >= nextDue : ageMs >= CACHE_TTL_MS);
   const coolingDown = lastAttempt > 0 && (Date.now() - lastAttempt) < SYNC_RETRY_FLOOR_MS;
   return { lastSync, ageMs, due: due && !coolingDown, coldStart: lastSync === 0 };
 }
 
 export default {
-  // 1. Background 15-Min Cron Trigger
+  // 1. Background cron (every minute): syncs only when the adaptive due time
+  // has passed (see FEED_TARGET_FILL), otherwise it is one meta read.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(syncUsageData(env, false, false));
+    ctx.waitUntil((async () => {
+      const state = await getSyncTriggerState(env.DB);
+      if (state.due) await syncUsageData(env, false, false);
+    })());
   },
 
   // 2. HTTP Request Handler
@@ -443,13 +473,45 @@ export default {
           const catalogMap = safeJsonParse(pushMeta.model_pricing_json, {});
           const plan = safeJsonParse(pushMeta.plan_info_json, null);
           const seenSet = await getSeenIds(env.DB, usages.map(u => u && u.id));
+          const pushGap = usages.length >= USAGE_FEED_LIMIT
+            && !usages.some(u => u && u.id && seenSet.has(u.id))
+            && !(await isLedgerEmpty(env.DB));
+          await ensureHourlyBackfill(env.DB);
           const { newRecordsCount } = await ingestUsageItems(env.DB, usages, seenSet, catalogMap, [], planPool(plan));
+          // The pushed by-model snapshot was read in the browser BEFORE this
+          // ingest, the same ordering the cron sync relies on.
+          let pushReconciled = 0;
+          if (Array.isArray(body.byModel) && body.byModel.length > 0) {
+            try {
+              const pushTs = usages.map(u => (u && u.createdAt ? new Date(u.createdAt).getTime() : NaN)).filter(Number.isFinite);
+              const oldest = pushTs.length ? Math.min(...pushTs) : Date.now();
+              const prevCov = safeJsonParse(await getMeta(env.DB, "last_sync_coverage_json"), null);
+              const rec = await reconcileFeedGaps(env.DB, {
+                window: body.byModelWindow || null,
+                fetchedAt: Date.now() - 2000,
+                data: body.byModel.map(r => ({
+                  model: canonicalModelSlug((r && r.model) || "unknown"),
+                  requests: Number(r.requests) || 0,
+                  creditsTotal: Number(r.creditsTotal) || 0,
+                  consumedMonthlyCredits: Number(r.consumedMonthlyCredits) || 0
+                }))
+              }, pushGap ? gapPlacementMs(prevCov, { oldestFetchedIso: new Date(oldest).toISOString() }) : null, catalogMap, plan);
+              pushReconciled = rec ? rec.requests : 0;
+            } catch (_) {}
+          } else if (pushGap) {
+            // No by-model snapshot in this push (old bookmarklet): leave the gap
+            // pending for the next sync that has one.
+            const prevCov = safeJsonParse(await getMeta(env.DB, "last_sync_coverage_json"), null);
+            const pushTs = usages.map(u => (u && u.createdAt ? new Date(u.createdAt).getTime() : NaN)).filter(Number.isFinite);
+            const oldest = pushTs.length ? Math.min(...pushTs) : Date.now();
+            await setMeta(env.DB, "recon_pending_gap_ms", String(gapPlacementMs(prevCov, { oldestFetchedIso: new Date(oldest).toISOString() })));
+          }
           // A push is not a cron sync: it must not clear the persisted sync errors,
           // the auth status badge or the latency stats (a dead cookie would show
           // green). It records its own result and refreshes the row counts only.
           await setMetaMany(env.DB, {
             last_push_ts: String(Date.now()),
-            last_push_status: `OK (+${newRecordsCount} new requests)`,
+            last_push_status: `OK (+${newRecordsCount} new requests${pushReconciled ? `, ${pushReconciled} reconciled` : ""})`,
             table_counts_json: JSON.stringify(await computeTableCounts(env.DB))
           });
           return jsonResponse({ ok: true, newRecordsCount }, 200, CORS_HEADERS);
@@ -472,7 +534,7 @@ export default {
           }
         }
 
-        const dashboardData = await getDashboardAggregates(env.DB, edgeColo);
+        const dashboardData = await getDashboardAggregates(env.DB, edgeColo, { hourly: url.searchParams.get("hourly") === "1" });
         return jsonResponse({ ok: true, syncResult, data: dashboardData });
       }
 
@@ -542,8 +604,11 @@ async function syncUsageDataUnlocked(env, forced = false, forceCatalogSync = fal
     sqlWriteMs: 0
   };
 
-  const savedCookie = await getMeta(db, "override_cookie");
+  const prevMeta = await getMetaMany(db, ["override_cookie", "last_sync_ts", "last_sync_coverage_json"]);
+  const savedCookie = prevMeta.override_cookie;
   const rawCookie = savedCookie || env.CC_COOKIE || "";
+  const prevSyncTs = Number(prevMeta.last_sync_ts) || 0;
+  const prevCoverage = safeJsonParse(prevMeta.last_sync_coverage_json, null);
 
   if (!rawCookie) {
     await recordSystemError(db, "AUTH_MISSING", "CC_COOKIE secret is not set.");
@@ -578,6 +643,7 @@ async function syncUsageDataUnlocked(env, forced = false, forceCatalogSync = fal
     windowLimits = await fetchCcWindowLimits(cookieHeader, env, authProbe);
     if (windowLimits) await setMeta(db, "window_limits_json", JSON.stringify(windowLimits));
     byModelPeriod = await fetchCcByModelPeriod(db, cookieHeader, authProbe);
+    if (byModelPeriod) byModelPeriod.fetchedAt = Date.now();
     if (byModelPeriod) await setMeta(db, "cc_by_model_json", JSON.stringify(byModelPeriod));
   } catch (wlErr) {
     syncErrors.push({ source: "WINDOW_LIMITS", code: "EX", message: `Window limits fetch error: ${wlErr && wlErr.message}. Ledger estimate will be used.`, ts: new Date().toISOString() });
@@ -668,8 +734,10 @@ async function syncUsageDataUnlocked(env, forced = false, forceCatalogSync = fal
   // same-sync allowance or plan change is already reflected in frozen credits.
   let newRecordsCount = 0;
   let lastDbMeta = null;
+  let reconciled = null;
   if (usages.length > 0) {
     try {
+      await ensureHourlyBackfill(db);
       const batchResult = await ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors, planPool(plan));
       newRecordsCount = batchResult.newRecordsCount;
       latencies.sqlWriteMs = batchResult.writeLatencyMs;
@@ -687,12 +755,30 @@ async function syncUsageDataUnlocked(env, forced = false, forceCatalogSync = fal
     }
   }
 
+  // Gap reconciliation against CC's own per-model totals (fills what the
+  // 100-entry feed dropped). Runs on every sync with by-model data: it also
+  // keeps the baseline current between gaps.
+  try {
+    const gapAtMs = gapSuspected ? gapPlacementMs(prevCoverage, coverageInfo) : null;
+    reconciled = await reconcileFeedGaps(db, byModelPeriod, gapAtMs, catalogMap, plan);
+    if (reconciled && reconciled.requests > 0) {
+      coverageInfo.reconciledRequests = reconciled.requests;
+      const gapErr = syncErrors.find(e => e.source === "USAGE_FEED_GAP");
+      const note = `${reconciled.requests} missed request(s) were reconciled from CC's per-model totals (${reconciled.models.join(", ")}) and booked to ${reconciled.usageDate} ${String(reconciled.usageHour).padStart(2, "0")}:00 IST with estimated tokens/cost.`;
+      if (gapErr) gapErr.message = `The usage feed returned ${usages.length} requests and none were seen before, so some requests made before ${coverageInfo.oldestFetchedIso} were never served. ${note}`;
+    }
+  } catch (recErr) {
+    syncErrors.push({ source: "RECONCILE", code: "EX", message: `Gap reconciliation failed: ${recErr && recErr.message}`, ts: new Date().toISOString() });
+  }
+
+  const nextDueTs = planNextSyncDue(prevSyncTs, newRecordsCount, gapSuspected);
   const nowTs = await enforceRetentionAndMeta(env, newRecordsCount, "OK", {
     latencies,
     syncErrors,
     dbMeta: lastDbMeta,
     coverageInfo,
-    cookieHeader
+    cookieHeader,
+    extraMeta: { next_sync_due_ts: String(nextDueTs) }
   });
 
   return {
@@ -703,6 +789,8 @@ async function syncUsageDataUnlocked(env, forced = false, forceCatalogSync = fal
     totalFetched: usages.length,
     gapSuspected,
     newRecordsCount,
+    reconciledRequests: reconciled ? reconciled.requests : 0,
+    nextSyncDueIso: new Date(nextDueTs).toISOString(),
     latencies,
     errorsCount: syncErrors.length,
     cookieRotated: rotatedThisSync,
@@ -1072,11 +1160,31 @@ function extractDocModelId(rawCell) {
   return { modelId, linkName: stripHtml(m[2]) };
 }
 
+// The /models/<slug> link slug is not always the API id the usage feed reports:
+// "Tencent Hy3" links to /models/tencent-hy3 but is billed as "tencent/hy3-paid"
+// (feed slug hy3-paid), which no prefix rule can bridge. The plan page embeds
+// its model list as RSC JSON ({"slug":"tencent-hy3","id":"tencent/hy3-paid",...},
+// quotes backslash-escaped inside the flight payload), so read slug -> API id
+// from there. Returns {} when the payload shape changes; lookups then fall back
+// to the link slug as before.
+function extractDocApiIds(html) {
+  const out = {};
+  const re = /\\?"slug\\?":\\?"([^"\\]+)\\?",\\?"id\\?":\\?"([^"\\]+)\\?"/g;
+  let m;
+  while ((m = re.exec(String(html || ""))) !== null) {
+    const docSlug = canonicalModelSlug(m[1]);
+    const apiId = canonicalModelSlug(m[2]);
+    if (docSlug && apiId && apiId !== docSlug && !out[docSlug]) out[docSlug] = apiId;
+  }
+  return out;
+}
+
 // Parses the model tables on https://commandcode.ai/docs/plans/<plan> (same
 // layout on the Go and GOAT pages): rates/intelligence, request estimates and
 // one or more "Monthly credits" allowance tables.
 function parsePlanTablesHtml(html, roleMap = {}) {
   const catalog = {};
+  const apiIdByDocSlug = extractDocApiIds(html);
   const tableRegex = /<table[^>]*>([\s\S]*?)<\/table>/gi;
   let tableMatch;
 
@@ -1139,6 +1247,7 @@ function parsePlanTablesHtml(html, roleMap = {}) {
         catalog[slug].peakSchedule = parsedPeak;
       }
       if (modelId && !catalog[slug].modelId) catalog[slug].modelId = modelId;
+      if (modelId && !catalog[slug].apiId && apiIdByDocSlug[modelId]) catalog[slug].apiId = apiIdByDocSlug[modelId];
 
       // Table 1: Model | Context | Intelligence | Input | Output | Cache read | Cache write | Caps
       if (headerSig.includes("intelligence")) {
@@ -1642,6 +1751,7 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
   let hitAlreadySeen = false;
   let newRecordsCount = 0;
   const statements = [];
+  const ingested = [];
   const lookupMemo = new Map();
   const reportedMissing = buildReportedMissingSet(syncErrors);
   const observedAt = Date.now();
@@ -1656,7 +1766,9 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
 
     // Convert timestamp to IST Date (UTC + 05:30)
     const createdMs = item.createdAt ? new Date(item.createdAt).getTime() : Date.now();
-    const usageDate = new Date(createdMs + IST_OFFSET_MS).toISOString().slice(0, 10);
+    const istIso = new Date(createdMs + IST_OFFSET_MS).toISOString();
+    const usageDate = istIso.slice(0, 10);
+    const usageHour = Number(istIso.slice(11, 13));
 
     const meta = item.meta || {};
     const model = normalizeModelSlug(meta.model || "unknown");
@@ -1705,8 +1817,9 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
     const creditInfo = computeRequestCredits(baseRates, stickerBasis, monthlyPoolUsd);
 
     // STATEMENTS_PER_REQUEST statements, pushed together: the per-request ledger
-    // row (which is also the dedupe record) and the daily rollup upsert. Batches
-    // are cut on multiples of STATEMENTS_PER_REQUEST, so both commit or neither.
+    // row (which is also the dedupe record), the daily rollup upsert and the
+    // hourly rollup upsert. Batches are cut on multiples of STATEMENTS_PER_REQUEST,
+    // so all three commit or none does.
     statements.push(
       db.prepare(`
         INSERT OR IGNORE INTO cc_request_credits (
@@ -1748,15 +1861,21 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
         tokensInTotal, tokensInFresh, tokensCached, tokensOut,
         planCost, inputCost, cacheCost, outputCost, planCost, durationMs,
         creditInfo.credits
+      ),
+      db.prepare(HOURLY_UPSERT_SQL).bind(
+        usageDate, usageHour, model, 1, isFailedOrWasted,
+        tokensInTotal, tokensInFresh, tokensCached, tokensOut,
+        planCost, inputCost, cacheCost, outputCost, creditInfo.credits, 0
       )
     );
     newRecordsCount++;
+    ingested.push({ model, createdMs });
   }
 
   const tWrite0 = performance.now();
   let lastDbMeta = null;
   if (statements.length === 0) {
-    return { hitAlreadySeen, newRecordsCount, writeLatencyMs: 0, dbMeta: null };
+    return { hitAlreadySeen, newRecordsCount, writeLatencyMs: 0, dbMeta: null, ingested };
   }
   for (let i = 0; i < statements.length; i += INGEST_BATCH_SIZE) {
     const batchRes = await db.batch(statements.slice(i, i + INGEST_BATCH_SIZE));
@@ -1765,7 +1884,255 @@ async function ingestUsageItems(db, usages, seenSet, catalogMap, syncErrors = []
     }
   }
   const writeLatencyMs = Math.round(performance.now() - tWrite0);
-  return { hitAlreadySeen, newRecordsCount, writeLatencyMs, dbMeta: lastDbMeta };
+  return { hitAlreadySeen, newRecordsCount, writeLatencyMs, dbMeta: lastDbMeta, ingested };
+}
+
+// Shared by live ingest and gap reconciliation (bind order: date, hour, model,
+// requests, failed, tokens in/fresh/cached/out, plan/input/cache/output cost,
+// credits, reconciled requests).
+const HOURLY_UPSERT_SQL = `
+  INSERT INTO cc_hourly_model_usage (
+    usage_date, usage_hour, model, requests_count, failed_wasted_count,
+    tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out,
+    plan_cost, input_cost, cache_cost, output_cost, credits_consumed, reconciled_requests
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(usage_date, usage_hour, model) DO UPDATE SET
+    requests_count = requests_count + excluded.requests_count,
+    failed_wasted_count = failed_wasted_count + excluded.failed_wasted_count,
+    tokens_in_total = tokens_in_total + excluded.tokens_in_total,
+    tokens_in_fresh = tokens_in_fresh + excluded.tokens_in_fresh,
+    tokens_cached = tokens_cached + excluded.tokens_cached,
+    tokens_out = tokens_out + excluded.tokens_out,
+    plan_cost = plan_cost + excluded.plan_cost,
+    input_cost = input_cost + excluded.input_cost,
+    cache_cost = cache_cost + excluded.cache_cost,
+    output_cost = output_cost + excluded.output_cost,
+    credits_consumed = credits_consumed + excluded.credits_consumed,
+    reconciled_requests = reconciled_requests + excluded.reconciled_requests
+`;
+
+// Next adaptive sync time: poll again roughly when FEED_TARGET_FILL new requests
+// are expected at the rate the last interval showed.
+function planNextSyncDue(prevSyncTs, newRecordsCount, gapSuspected) {
+  const now = Date.now();
+  if (gapSuspected) return now + SYNC_MIN_INTERVAL_MS;
+  const elapsedMs = prevSyncTs > 0 ? Math.max(SYNC_MIN_INTERVAL_MS, now - prevSyncTs) : SYNC_MAX_INTERVAL_MS;
+  const ratePerMs = newRecordsCount / elapsedMs;
+  const interval = ratePerMs > 0 ? FEED_TARGET_FILL / ratePerMs : SYNC_MAX_INTERVAL_MS;
+  return now + Math.round(Math.min(SYNC_MAX_INTERVAL_MS, Math.max(SYNC_MIN_INTERVAL_MS, interval)));
+}
+
+// Missed requests happened between the newest request the previous sync saw and
+// the oldest one this page holds; book them at the midpoint.
+function gapPlacementMs(prevCoverage, coverageInfo) {
+  const hi = coverageInfo && coverageInfo.oldestFetchedIso ? new Date(coverageInfo.oldestFetchedIso).getTime() : Date.now();
+  const lo = prevCoverage && prevCoverage.newestFetchedIso ? new Date(prevCoverage.newestFetchedIso).getTime() : NaN;
+  return Number.isFinite(lo) && lo < hi ? Math.round((lo + hi) / 2) : hi - 60 * 1000;
+}
+
+// Gap reconciliation. CC's /internal/usage/by-model returns per-model request
+// counts for the billing period, and it is read BEFORE the usage feed in every
+// sync (and before the ingest in a bookmarklet push), so with nothing missed the
+// tracker's count of requests since a baseline is always >= CC's. Any positive
+// difference is either a request the feed dropped (it serves the newest 100
+// only) or a counting quirk on CC's side:
+//   diff = (CC now - CC at baseline) - ledger rows since baseline - adjustments
+// When a gap was detected (this sync or an earlier one still pending), diff is
+// written to the daily + hourly rollups as reconciled requests with that model's
+// recent per-request averages for tokens/cost/credits. Without a detected gap the
+// diff is absorbed into the adjustments, so drift never turns into fake usage.
+async function reconcileFeedGaps(db, byModelPeriod, gapAtMs, catalogMap, plan) {
+  const meta = await getMetaMany(db, ["recon_state_json", "recon_pending_gap_ms"]);
+  const pendingGapMs = Number(meta.recon_pending_gap_ms) || 0;
+  const gapMs = gapAtMs || pendingGapMs || null;
+  if (!byModelPeriod || !Array.isArray(byModelPeriod.data) || byModelPeriod.data.length === 0) {
+    if (gapAtMs) await setMeta(db, "recon_pending_gap_ms", String(gapAtMs));
+    return null;
+  }
+  const fetchedAt = Number(byModelPeriod.fetchedAt) || Date.now();
+  const cc = {};
+  for (const r of byModelPeriod.data) {
+    if (!r || !r.model || BUILTIN_TOOLS.has(r.model)) continue;
+    const c = cc[r.model] || (cc[r.model] = { req: 0, cost: 0, credits: 0 });
+    c.req += Number(r.requests) || 0;
+    c.cost += Number(r.creditsTotal) || 0;
+    c.credits += Number(r.consumedMonthlyCredits) || 0;
+  }
+  const windowKey = JSON.stringify(byModelPeriod.window || null);
+  const state = safeJsonParse(meta.recon_state_json, null);
+  const reset = !state || state.windowKey !== windowKey
+    || Object.entries(cc).some(([m, c]) => state.base[m] && c.req < state.base[m].req);
+  const stale = state && (fetchedAt - state.baseTs) > RECON_REBASE_MS;
+  if (reset || (stale && !gapMs)) {
+    await setMetaMany(db, {
+      recon_state_json: JSON.stringify({ windowKey, baseTs: fetchedAt, base: cc, adj: {} }),
+      recon_pending_gap_ms: "0"
+    });
+    return { requests: 0, models: [], rebased: true };
+  }
+
+  const sinceRes = await db.prepare(`SELECT model, COUNT(*) AS n FROM cc_request_credits WHERE created_at > ? GROUP BY model`)
+    .bind(new Date(state.baseTs).toISOString()).all();
+  const since = new Map((sinceRes.results || []).map(r => [r.model, Number(r.n) || 0]));
+  const missed = [];
+  for (const [m, c] of Object.entries(cc)) {
+    const b = state.base[m] || { req: 0, cost: 0, credits: 0 };
+    const a = state.adj[m] || { req: 0, cost: 0, credits: 0 };
+    const diff = (c.req - b.req) - (since.get(m) || 0) - a.req;
+    if (diff <= 0) continue;
+    a.req += diff;
+    state.adj[m] = a;
+    if (gapMs) missed.push({ model: m, n: diff, cc: c, b });
+  }
+
+  let result = { requests: 0, models: [] };
+  if (missed.length > 0) {
+    const istIso = new Date(gapMs + IST_OFFSET_MS).toISOString();
+    const usageDate = istIso.slice(0, 10);
+    const usageHour = Number(istIso.slice(11, 13));
+    const avgCutoff = istDateStr(gapMs - 7 * 86400000);
+    const avgRes = await db.prepare(`
+      SELECT model, SUM(requests_count - reconciled_requests) AS n,
+        SUM(failed_wasted_count) AS failed, SUM(tokens_in_total) AS tin, SUM(tokens_in_fresh) AS tfresh,
+        SUM(tokens_cached) AS tcached, SUM(tokens_out) AS tout, SUM(plan_cost) AS plan,
+        SUM(input_cost) AS ic, SUM(cache_cost) AS cc, SUM(output_cost) AS oc,
+        SUM(CASE WHEN credits_consumed < 0 THEN 0 ELSE credits_consumed END) AS credits
+      FROM cc_daily_model_usage WHERE usage_date >= ? AND reconciled_requests < requests_count
+        AND model IN (${missed.map(() => "?").join(",")})
+      GROUP BY model
+    `).bind(avgCutoff, ...missed.map(x => x.model)).all();
+    const avgByModel = new Map((avgRes.results || []).map(r => [r.model, r]));
+    const statements = [];
+    for (const x of missed) {
+      const avg = avgByModel.get(x.model);
+      const per = (k) => (avg && Number(avg.n) > 0) ? Number(avg[k] || 0) / Number(avg.n) : 0;
+      // No local history for the model: take cost and pool credits from CC's
+      // own period averages (tokens stay unknown).
+      const ccReq = Math.max(1, x.cc.req);
+      const planEach = avg ? per("plan") : x.cc.cost / ccReq;
+      const creditsEach = avg ? per("credits") : x.cc.credits / ccReq;
+      const n = x.n;
+      const v = {
+        failed: Math.round(per("failed") * n),
+        tin: Math.round(per("tin") * n), tfresh: Math.round(per("tfresh") * n),
+        tcached: Math.round(per("tcached") * n), tout: Math.round(per("tout") * n),
+        plan: planEach * n, ic: per("ic") * n, cc: per("cc") * n, oc: per("oc") * n,
+        credits: creditsEach * n
+      };
+      statements.push(
+        db.prepare(`
+          INSERT INTO cc_daily_model_usage (
+            usage_date, model, requests_count, failed_wasted_count,
+            tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out,
+            plan_cost, input_cost, cache_cost, output_cost, actual_api_cost, duration_ms_total,
+            credits_consumed, reconciled_requests
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+          ON CONFLICT(usage_date, model) DO UPDATE SET
+            requests_count = requests_count + excluded.requests_count,
+            failed_wasted_count = failed_wasted_count + excluded.failed_wasted_count,
+            tokens_in_total = tokens_in_total + excluded.tokens_in_total,
+            tokens_in_fresh = tokens_in_fresh + excluded.tokens_in_fresh,
+            tokens_cached = tokens_cached + excluded.tokens_cached,
+            tokens_out = tokens_out + excluded.tokens_out,
+            plan_cost = plan_cost + excluded.plan_cost,
+            input_cost = input_cost + excluded.input_cost,
+            cache_cost = cache_cost + excluded.cache_cost,
+            output_cost = output_cost + excluded.output_cost,
+            actual_api_cost = actual_api_cost + excluded.actual_api_cost,
+            credits_consumed = CASE WHEN credits_consumed < 0
+              THEN excluded.credits_consumed
+              ELSE credits_consumed + excluded.credits_consumed END,
+            reconciled_requests = reconciled_requests + excluded.reconciled_requests
+        `).bind(usageDate, x.model, n, v.failed, v.tin, v.tfresh, v.tcached, v.tout,
+          v.plan, v.ic, v.cc, v.oc, v.plan, v.credits, n),
+        db.prepare(HOURLY_UPSERT_SQL).bind(usageDate, usageHour, x.model, n, v.failed,
+          v.tin, v.tfresh, v.tcached, v.tout, v.plan, v.ic, v.cc, v.oc, v.credits, n)
+      );
+      result.requests += n;
+      result.models.push(`${x.model} +${n}`);
+    }
+    await db.batch(statements);
+    result.usageDate = usageDate;
+    result.usageHour = usageHour;
+  }
+  await setMetaMany(db, {
+    recon_state_json: JSON.stringify(state),
+    recon_pending_gap_ms: "0"
+  });
+  return result;
+}
+
+// One-time hourly backfill (meta hourly_exact_from marks it done). The daily
+// rollup never stored a time of day, but the per-request ledger
+// (cc_request_credits, 8 days) has created_at for every request it holds. For
+// each date whose ledger count equals its daily requests_count, the hourly rows
+// are rebuilt exactly (requests, billed cost, frozen credits per hour); token and
+// sticker-cost splits are apportioned from that day's rollup by request share.
+// Dates before hourly_exact_from are estimated on the page from the user's own
+// hour-of-day profile instead (see applyTimeWindow in the dashboard script).
+// Must run before the first ingest that writes hourly rows, so both the sync and
+// the bookmarklet push call it first.
+async function ensureHourlyBackfill(db) {
+  const done = await getMeta(db, "hourly_exact_from");
+  if (done) return done;
+  const [dailyRes, ledgerRes] = await db.batch([
+    db.prepare(`SELECT usage_date, SUM(requests_count) AS n FROM cc_daily_model_usage GROUP BY usage_date`),
+    db.prepare(`SELECT usage_date, COUNT(*) AS n FROM cc_request_credits GROUP BY usage_date`)
+  ]);
+  const ledgerByDate = new Map((ledgerRes.results || []).map(r => [r.usage_date, Number(r.n)]));
+  const ledgerDates = [...ledgerByDate.keys()].sort();
+  const todayIst = istDateStr(Date.now());
+  // The oldest ledger date is cut mid-day by the 8-day retention, so it never counts.
+  let exactFrom = istDateStr(Date.now() + 86400000);
+  if (ledgerDates.length > 1) {
+    const dailyDates = (dailyRes.results || []).map(r => [r.usage_date, Number(r.n)]).sort((a, b) => a[0] < b[0] ? -1 : 1);
+    let candidate = null;
+    for (const [d, n] of dailyDates) {
+      if (d <= ledgerDates[0]) continue;
+      if (ledgerByDate.get(d) === n) { if (!candidate) candidate = d; }
+      else candidate = null;
+    }
+    if (candidate) exactFrom = candidate;
+    else if (!dailyDates.some(([d]) => d >= todayIst)) exactFrom = todayIst;
+  } else if (ledgerDates.length === 0) {
+    // Fresh database: everything from today on is recorded live.
+    exactFrom = todayIst;
+  }
+  await db.batch([
+    db.prepare(`DELETE FROM cc_hourly_model_usage WHERE usage_date >= ?`).bind(exactFrom),
+    db.prepare(`
+      INSERT INTO cc_hourly_model_usage (
+        usage_date, usage_hour, model, requests_count, failed_wasted_count,
+        tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out,
+        plan_cost, input_cost, cache_cost, output_cost, credits_consumed, reconciled_requests
+      )
+      SELECT h.usage_date, h.usage_hour, h.model, h.n,
+        CAST(ROUND(d.failed_wasted_count * 1.0 * h.n / d.requests_count) AS INTEGER),
+        CAST(ROUND(d.tokens_in_total * 1.0 * h.n / d.requests_count) AS INTEGER),
+        CAST(ROUND(d.tokens_in_fresh * 1.0 * h.n / d.requests_count) AS INTEGER),
+        CAST(ROUND(d.tokens_cached * 1.0 * h.n / d.requests_count) AS INTEGER),
+        CAST(ROUND(d.tokens_out * 1.0 * h.n / d.requests_count) AS INTEGER),
+        h.billed,
+        d.input_cost * h.sticker / NULLIF(h.day_sticker, 0),
+        d.cache_cost * h.sticker / NULLIF(h.day_sticker, 0),
+        d.output_cost * h.sticker / NULLIF(h.day_sticker, 0),
+        h.credits, 0
+      FROM (
+        SELECT usage_date, model, usage_hour, n, billed, sticker, credits,
+          SUM(sticker) OVER (PARTITION BY usage_date, model) AS day_sticker
+        FROM (
+          SELECT usage_date, model,
+            CAST(strftime('%H', datetime(created_at, '+330 minutes')) AS INTEGER) AS usage_hour,
+            COUNT(*) AS n, SUM(billed_usd) AS billed, SUM(sticker_usd) AS sticker, SUM(credits) AS credits
+          FROM cc_request_credits WHERE usage_date >= ?
+          GROUP BY usage_date, model, usage_hour
+        )
+      ) h
+      JOIN cc_daily_model_usage d ON d.usage_date = h.usage_date AND d.model = h.model AND d.requests_count > 0
+    `).bind(exactFrom),
+    db.prepare(`INSERT INTO cc_meta (key, value) VALUES ('hourly_exact_from', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(exactFrom)
+  ]);
+  return exactFrom;
 }
 
 async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag = {}) {
@@ -1834,6 +2201,7 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
   const retentionPromise = runRetention
     ? db.batch([
         db.prepare(`DELETE FROM cc_daily_model_usage WHERE usage_date < ?`).bind(rollupCutoffIst),
+        db.prepare(`DELETE FROM cc_hourly_model_usage WHERE usage_date < ?`).bind(rollupCutoffIst),
         db.prepare(`DELETE FROM cc_request_credits WHERE created_at < ?`).bind(ledgerCutoffIso),
         db.prepare(`DELETE FROM cc_meta WHERE key IN (${OBSOLETE_META_KEYS.map(() => "?").join(",")})`).bind(...OBSOLETE_META_KEYS)
       ])
@@ -1862,6 +2230,7 @@ async function enforceRetentionAndMeta(env, newRecordsCount, prefix = "OK", diag
   if (runRetention) metaEntries.last_retention_run_ts = String(nowTs);
   if (billingSummaryText) metaEntries.billing_summary_json = billingSummaryText;
   if (coverageInfo) metaEntries.last_sync_coverage_json = JSON.stringify(coverageInfo);
+  if (diag.extraMeta) Object.assign(metaEntries, diag.extraMeta);
   await setMetaMany(db, metaEntries);
 
   return nowTs;
@@ -1872,6 +2241,7 @@ async function computeTableCounts(db) {
     SELECT
       (SELECT COUNT(*) FROM cc_daily_model_usage) AS daily_rows_count,
       (SELECT COUNT(*) FROM cc_request_credits) AS request_credits_count,
+      (SELECT COUNT(*) FROM cc_hourly_model_usage) AS hourly_rows_count,
       (SELECT COUNT(*) FROM cc_meta) AS meta_rows_count,
       (SELECT COUNT(DISTINCT usage_date) FROM cc_daily_model_usage) AS active_days
   `).first();
@@ -1917,7 +2287,7 @@ function lookupCatalogModel(model, catalogMap, syncErrors = [], memo = null, rep
   // slug (beam-free, qwen3-8-max). Resolve that before the fuzzy prefix pass so a
   // correctly-catalogued model is never flagged unmapped / charged the 1x fallback.
   for (const v of Object.values(catalogMap || {})) {
-    if (v && v.modelId && v.modelId === slug) {
+    if (v && ((v.modelId && v.modelId === slug) || (v.apiId && v.apiId === slug))) {
       if (memo) memo.set(slug, v);
       return v;
     }
@@ -1933,7 +2303,7 @@ function lookupCatalogModel(model, catalogMap, syncErrors = [], memo = null, rep
   let bestLen = -1;
   for (const [k, v] of Object.entries(catalogMap || {})) {
     if (!v) continue;
-    for (const key of [k, v.modelId]) {
+    for (const key of [k, v.modelId, v.apiId]) {
       if (!key || !slug.startsWith(key) || !RELEASE_TAG_SUFFIX.test(slug.slice(key.length))) continue;
       if (key.length > bestLen) { bestLen = key.length; best = v; }
     }
@@ -1976,18 +2346,23 @@ async function recordSystemError(db, source, message) {
 // ============================================================================
 // Dashboard Aggregations, Billing Cycle Window, 5h/7d & Smart GOAT Advisor
 // ============================================================================
-async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
+async function getDashboardAggregates(db, edgeColo = "UNKNOWN", opts = {}) {
   const tSql0 = performance.now();
   // usage_date is an IST calendar date: compute the cutoff in JS (IST).
   const rollupCutoffIst = istDateStr(Date.now() - ROLLUP_RETENTION_DAYS * 86400000);
   // Per-request ledger for the rolling windows (7 days).
   const ledgerCutoffIso = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
-  const [dailyRowsRes, metaRowsRes, ledgerRowsRes] = await db.batch([
-    db.prepare(`SELECT usage_date, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost, credits_consumed FROM cc_daily_model_usage WHERE usage_date >= ? ORDER BY usage_date DESC, plan_cost DESC`).bind(rollupCutoffIst),
+  const reads = [
+    db.prepare(`SELECT usage_date, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost, credits_consumed, reconciled_requests FROM cc_daily_model_usage WHERE usage_date >= ? ORDER BY usage_date DESC, plan_cost DESC`).bind(rollupCutoffIst),
     // Named keys only: cc_meta also holds the session cookie, which no page needs.
     db.prepare(`SELECT key, value FROM cc_meta WHERE key IN (${DASHBOARD_META_KEYS.map(() => "?").join(",")})`).bind(...DASHBOARD_META_KEYS),
     db.prepare(`SELECT id, created_at, model, sticker_usd, billed_usd, credits FROM cc_request_credits WHERE created_at >= ?`).bind(ledgerCutoffIso)
-  ]);
+  ];
+  // Hour-of-day rows are only read when the page's time filter asks for them.
+  if (opts.hourly) {
+    reads.push(db.prepare(`SELECT usage_date, usage_hour, model, requests_count, failed_wasted_count, tokens_in_total, tokens_in_fresh, tokens_cached, tokens_out, plan_cost, input_cost, cache_cost, output_cost, credits_consumed, reconciled_requests FROM cc_hourly_model_usage WHERE usage_date >= ?`).bind(rollupCutoffIst));
+  }
+  const [dailyRowsRes, metaRowsRes, ledgerRowsRes, hourlyRowsRes] = await db.batch(reads);
   const sqlReadLatencyMs = Math.round(performance.now() - tSql0);
 
   const metaMap = {};
@@ -2035,13 +2410,14 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
   // Turn profile for the Advisor (needs the fresh/cached/output split, which
   // the page itself no longer shows).
   let totReqsRaw = 0, totInAll = 0, totInFresh = 0, totInCached = 0, totOut = 0;
-  const enrichedRows = rawRows.map(r => {
+  for (const r of rawRows) {
     totReqsRaw += Number(r.requests_count || 0);
     totInAll += Number(r.tokens_in_total || 0);
     totInFresh += Number(r.tokens_in_fresh || 0);
     totInCached += Number(r.tokens_cached || 0);
     totOut += Number(r.tokens_out || 0);
-
+  }
+  const enrichRow = (r) => {
     const cat = lookupCatalogModel(r.model, catalogMap, lookupWarnings, enrichMemo, reportedMissing);
     const isFreeModel = Boolean(cat.isFree);
     let capUsd = (cat.monthlyCapUsd !== null && cat.monthlyCapUsd !== undefined) ? Number(cat.monthlyCapUsd) : null;
@@ -2090,9 +2466,22 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
       effective_real_usd: realPocketCost,
       net_plan_savings_usd: netPlanSavings,
       leverage_multiplier: leverage,
+      reconciled_requests: Number(r.reconciled_requests || 0),
       role: cat.role || null
     };
-  });
+  };
+  const enrichedRows = rawRows.map(enrichRow);
+  // Compact hourly rows: [date, hour, model, requests, failed, tokens_total,
+  // tokens_in_total, tokens_cached, plan_cost, credits, real_usd, net_savings,
+  // pool_drain_pct, reconciled]. Per-model constants (cap, burn, role) come from
+  // the daily rows on the page.
+  const hourlyModelRows = hourlyRowsRes ? (hourlyRowsRes.results || []).map(r => {
+    const e = enrichRow(r);
+    const r4 = (x) => Number(Number(x || 0).toFixed(4));
+    return [e.usage_date, Number(r.usage_hour), e.model, e.requests_count, e.failed_wasted_count,
+      e.tokens_total, e.tokens_in_total, e.tokens_cached, r4(e.plan_cost), r4(e.credits_consumed),
+      r4(e.effective_real_usd), r4(e.net_plan_savings_usd), e.pool_drain_pct, e.reconciled_requests];
+  }) : null;
 
   const billingSummary = safeJsonParse(metaMap.billing_summary_json, null);
   const savedLatencies = safeJsonParse(metaMap.last_latencies_json, {});
@@ -2214,6 +2603,9 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
   const dbSizeBytes = savedLatencies.dbSizeBytes || 0;
 
   return {
+    hourlyModelRows,
+    hourlyExactFrom: metaMap.hourly_exact_from || null,
+    nextSyncDueTs: Number(metaMap.next_sync_due_ts || 0) || null,
     lastSyncTs,
     lastSyncIso: lastSyncTs ? new Date(lastSyncTs).toISOString() : null,
     lastSyncStatus: metaMap.last_sync_status || "Never synced",
@@ -2260,8 +2652,9 @@ async function getDashboardAggregates(db, edgeColo = "UNKNOWN") {
       tables: {
         cc_daily_model_usage: counts.daily_rows_count || 0,
         cc_request_credits: counts.request_credits_count || 0,
+        cc_hourly_model_usage: counts.hourly_rows_count || 0,
         cc_meta: counts.meta_rows_count || 0,
-        totalRows: (counts.daily_rows_count || 0) + (counts.request_credits_count || 0) + (counts.meta_rows_count || 0),
+        totalRows: (counts.daily_rows_count || 0) + (counts.hourly_rows_count || 0) + (counts.request_credits_count || 0) + (counts.meta_rows_count || 0),
         activeDays: counts.active_days || 0
       },
       storage: {
@@ -2346,6 +2739,10 @@ function makeSlimDashboardPayload(data) {
 
 function renderDashboardHtml(initialData) {
   const safeJson = JSON.stringify(initialData).replace(/</g, "\\u003c");
+  const hh = (h) => String(h).padStart(2, "0") + ":00";
+  // Time-of-day filter options (IST). 00:00 -> 24:00 is the "all day" default.
+  const HOUR_FROM_OPTS = Array.from({ length: 24 }, (_, h) => `<option value="${h}">${hh(h)}</option>`).join("");
+  const HOUR_TO_OPTS = Array.from({ length: 24 }, (_, i) => i + 1).map(h => `<option value="${h}"${h === 24 ? " selected" : ""}>${hh(h)}</option>`).join("");
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2547,6 +2944,8 @@ function renderDashboardHtml(initialData) {
     .pick-desc { font-size: 0.8rem; color: var(--muted); line-height: 1.4; }
 
     .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .time-filter { display: inline-flex; align-items: center; gap: 4px; }
+    .time-note { font-size: 0.74rem; color: var(--amber); }
     .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; background: rgba(21,28,40,0.5); padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); }
     input, select { background: var(--card); color: var(--text); border: 1px solid var(--border); padding: 7px 10px; border-radius: 8px; font-size: 0.84rem; }
     .section-title { font-size: 1.02rem; font-weight: 600; margin: 18px 0 10px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
@@ -2661,7 +3060,14 @@ function renderDashboardHtml(initialData) {
       <input type="date" id="dashDateFrom" onchange="setDashPeriod('custom')" />
       <span style="color:var(--muted)">to</span>
       <input type="date" id="dashDateTo" onchange="setDashPeriod('custom')" />
+      <span class="time-filter" title="Time of day (IST), applied to every day in the period. From later than To wraps past midnight (22:00 to 02:00).">
+        <span style="font-size:0.8rem;color:var(--muted);font-weight:600;">Time (IST):</span>
+        <select id="dashHourFrom" onchange="onTimeWindowChange()" aria-label="From time (IST)">${HOUR_FROM_OPTS}</select>
+        <span style="color:var(--muted)">-</span>
+        <select id="dashHourTo" onchange="onTimeWindowChange()" aria-label="To time (IST)">${HOUR_TO_OPTS}</select>
+      </span>
       <select id="dashModelFilter" onchange="renderDashboardTab()"><option value="all">All Used Models</option></select>
+      <span id="dashTimeNote" class="time-note" hidden></span>
       <span id="dashCycleMeta" class="badge badge-purple" style="margin-left:auto;">Cycle: -</span>
     </div>
 
@@ -2727,7 +3133,14 @@ function renderDashboardHtml(initialData) {
       <input type="date" id="trendDateFrom" onchange="setTrendPeriod('custom')" />
       <span style="color:var(--muted)">to</span>
       <input type="date" id="trendDateTo" onchange="setTrendPeriod('custom')" />
+      <span class="time-filter" title="Time of day (IST), applied to every day in the period. From later than To wraps past midnight (22:00 to 02:00).">
+        <span style="font-size:0.8rem;color:var(--muted);font-weight:600;">Time (IST):</span>
+        <select id="trendHourFrom" onchange="onTimeWindowChange()" aria-label="From time (IST)">${HOUR_FROM_OPTS}</select>
+        <span style="color:var(--muted)">-</span>
+        <select id="trendHourTo" onchange="onTimeWindowChange()" aria-label="To time (IST)">${HOUR_TO_OPTS}</select>
+      </span>
       <select id="trendModelFilter" onchange="renderTrendsTab()"><option value="all">All Used Models</option></select>
+      <span id="trendTimeNote" class="time-note" hidden></span>
       <span id="trendCycleMeta" class="badge badge-purple" style="margin-left:auto;">Cycle: -</span>
     </div>
 
@@ -3035,7 +3448,148 @@ function renderDashboardHtml(initialData) {
       return new Date(ms + 5.5 * 3600000).toISOString().slice(0, 10);
     }
 
+    // ---- Time-of-day filter (IST hours) ------------------------------------
+    // Hourly rows are fetched on demand (/api/data?hourly=1). Dates from
+    // rawData.hourlyExactFrom on have real hour buckets; older dates only have a
+    // daily total, so their share of the window is estimated from the user's own
+    // hour-of-day profile (per model when it has enough history, else overall).
+    let hourlyData = null;
+    let hourlyDataSyncTs = -1;
+    let hourlyLoading = null;
+    const HOURLY_PROFILE_MIN_REQS = 30;
+
+    function timeWindowFor(prefix) {
+      const fromEl = document.getElementById(prefix + 'HourFrom');
+      const toEl = document.getElementById(prefix + 'HourTo');
+      if (!fromEl || !toEl) return null;
+      const from = Number(fromEl.value), to = Number(toEl.value);
+      if (from === 0 && to === 24) return null;
+      if (from === to) return { from, to, hours: new Set() };
+      const hours = new Set();
+      for (let h = 0; h < 24; h++) {
+        if (from < to ? (h >= from && h < to) : (h >= from || h < to)) hours.add(h);
+      }
+      return { from, to, hours };
+    }
+
+    function anyTimeWindowActive() {
+      return Boolean(timeWindowFor('dash') || timeWindowFor('trend'));
+    }
+
+    async function ensureHourlyRows() {
+      if (hourlyData && hourlyDataSyncTs === rawData.lastSyncTs) return true;
+      if (hourlyLoading) return hourlyLoading;
+      hourlyLoading = (async () => {
+        try {
+          const res = await fetch('/api/data?hourly=1');
+          const out = await res.json();
+          if (out && out.ok && out.data) {
+            rawData = out.data;
+            hourlyData = out.data.hourlyModelRows || [];
+            hourlyDataSyncTs = out.data.lastSyncTs;
+            initModelDropdowns();
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      })();
+      try { return await hourlyLoading; } finally { hourlyLoading = null; }
+    }
+
+    async function onTimeWindowChange() {
+      if (anyTimeWindowActive()) {
+        const ok = await ensureHourlyRows();
+        if (!ok) alert('Could not load hourly data. Showing whole days.');
+      }
+      renderDashboardTab();
+      renderTrendsTab();
+    }
+
+    // Returns daily-shaped rows restricted to the time window, plus how many
+    // dates had to be estimated.
+    function applyTimeWindow(rows, tw) {
+      if (!tw) return { rows, estimatedDates: [] };
+      const exactFrom = rawData.hourlyExactFrom || '9999-99-99';
+      const H = hourlyData || [];
+      const byKey = new Map();
+      const profAll = new Array(24).fill(0);
+      const profModel = {};
+      for (const h of H) {
+        const d = h[0], hr = h[1], m = h[2], req = h[3];
+        if (d < exactFrom) continue;
+        profAll[hr] += req;
+        (profModel[m] || (profModel[m] = new Array(24).fill(0)))[hr] += req;
+        if (!tw.hours.has(hr)) continue;
+        const k = d + '|' + m;
+        const a = byKey.get(k) || { req: 0, failed: 0, tt: 0, tin: 0, tc: 0, plan: 0, cr: 0, real: 0, net: 0, pool: 0, rec: 0 };
+        a.req += req; a.failed += h[4]; a.tt += h[5]; a.tin += h[6]; a.tc += h[7];
+        a.plan += h[8]; a.cr += h[9]; a.real += h[10]; a.net += h[11]; a.pool += h[12]; a.rec += h[13];
+        byKey.set(k, a);
+      }
+      const share = (prof) => {
+        const total = prof.reduce((x, y) => x + y, 0);
+        if (!(total > 0)) return null;
+        let inWin = 0;
+        for (const hr of tw.hours) inWin += prof[hr];
+        return inWin / total;
+      };
+      const allShare = share(profAll);
+      const uniformShare = tw.hours.size / 24;
+      const shareCache = {};
+      const modelShare = (m) => {
+        if (m in shareCache) return shareCache[m];
+        const p = profModel[m];
+        const n = p ? p.reduce((x, y) => x + y, 0) : 0;
+        return (shareCache[m] = n >= HOURLY_PROFILE_MIN_REQS ? share(p) : (allShare ?? uniformShare));
+      };
+      const est = new Set();
+      const out = [];
+      for (const r of rows) {
+        if (r.usage_date >= exactFrom) {
+          const a = byKey.get(r.usage_date + '|' + r.model);
+          if (!a || a.req <= 0) continue;
+          out.push({ ...r, requests_count: a.req, failed_wasted_count: a.failed, tokens_total: a.tt,
+            tokens_in_total: a.tin, tokens_cached: a.tc, plan_cost: a.plan, credits_consumed: a.cr,
+            effective_real_usd: a.real, net_plan_savings_usd: a.net, pool_drain_pct: a.pool,
+            reconciled_requests: a.rec });
+        } else {
+          const f = modelShare(r.model);
+          if (!(f > 0)) continue;
+          est.add(r.usage_date);
+          out.push({ ...r, estimated: true,
+            requests_count: Math.round(r.requests_count * f), failed_wasted_count: Math.round(r.failed_wasted_count * f),
+            tokens_total: Math.round(r.tokens_total * f), tokens_in_total: Math.round(r.tokens_in_total * f),
+            tokens_cached: Math.round(r.tokens_cached * f), plan_cost: r.plan_cost * f,
+            credits_consumed: r.credits_consumed * f, effective_real_usd: r.effective_real_usd * f,
+            net_plan_savings_usd: r.net_plan_savings_usd * f, pool_drain_pct: r.pool_drain_pct * f,
+            reconciled_requests: Math.round((r.reconciled_requests || 0) * f) });
+        }
+      }
+      return { rows: out, estimatedDates: [...est].sort() };
+    }
+
     function filterRowsByPeriod(period, fromId, toId, modelSelectId) {
+      const prefix = fromId.replace('DateFrom', '');
+      const dated = filterRowsByDate(period, fromId, toId, modelSelectId);
+      const tw = timeWindowFor(prefix);
+      const note = document.getElementById(prefix + 'TimeNote');
+      if (tw && (!hourlyData || hourlyDataSyncTs !== rawData.lastSyncTs)) {
+        // Data was replaced (refresh / background poll): reload the hour buckets.
+        if (!hourlyLoading) ensureHourlyRows().then(ok => { if (ok) { renderDashboardTab(); renderTrendsTab(); } });
+      }
+      const res = applyTimeWindow(dated, tw);
+      if (note) {
+        if (tw && res.estimatedDates.length > 0) {
+          note.hidden = false;
+          note.textContent = '≈ ' + res.estimatedDates.length + ' day(s) before ' + (rawData.hourlyExactFrom || 'hourly tracking') + ' estimated from your hour-of-day pattern';
+        } else {
+          note.hidden = true;
+        }
+      }
+      return res.rows;
+    }
+
+    function filterRowsByDate(period, fromId, toId, modelSelectId) {
       const rows = rawData.dailyModelRows || [];
       const modelSel = document.getElementById(modelSelectId).value;
       const nowMs = Date.now();
@@ -3150,7 +3704,7 @@ function renderDashboardHtml(initialData) {
           'Bar source: <strong>' + escHtml(liveTxt) + '</strong> | ' +
           'Monthly pool: <strong>' + (monthlyPool ? (Number(monthlyPool.used).toFixed(2) + ' / ' + monthlyPool.granted + ' credits') : '-') + '</strong> | ' +
           'Usage feed: last sync fetched <strong>' + (cov ? (cov.totalFetched ?? 0) : 0) + '</strong> requests' +
-          (cov && cov.gapSuspected ? ' | <strong style="color:var(--amber)">GAP: more than 100 requests since the previous sync - some are missing from the daily tables.</strong>' : '');
+          (cov && cov.gapSuspected ? ' | <strong style="color:var(--amber)">GAP: more than 100 requests since the previous sync' + (cov.reconciledRequests ? ' - ' + cov.reconciledRequests + ' reconciled from CC per-model totals (estimated tokens/cost).' : ' - reconciling once CC per-model totals are available.') + '</strong>' : '');
       }
 
       // 2. Render Plan Value & Break-Even Bar
@@ -3197,7 +3751,8 @@ function renderDashboardHtml(initialData) {
             allowance: r.model_allowance_usd, leverage: r.leverage_multiplier,
             burnPerUsd: r.credit_burn_per_usd,
             free: Boolean(r.is_free_model),
-            unmapped: Boolean(r.unmapped_model_allowance)
+            unmapped: Boolean(r.unmapped_model_allowance),
+            reconciled: 0
           };
         }
         const m = byModel[r.model];
@@ -3210,6 +3765,7 @@ function renderDashboardHtml(initialData) {
         m.realPocket += Number(r.effective_real_usd || 0);
         m.netSav += Number(r.net_plan_savings_usd || 0);
         m.creditsUsed += Number(r.credits_consumed || 0);
+        m.reconciled += Number(r.reconciled_requests || 0);
       }
 
       document.getElementById('kpiPlanCost').textContent = fmtUsd(planCost);
@@ -3232,7 +3788,7 @@ function renderDashboardHtml(initialData) {
             return '<tr>' +
               '<td><strong>' + escHtml(m.model) + '</strong></td>' +
               '<td style="color:var(--muted)">' + escHtml(m.role) + '</td>' +
-              '<td>' + m.reqs + ' (' + m.wasted + ')</td>' +
+              '<td>' + m.reqs + ' (' + m.wasted + ')' + (m.reconciled > 0 ? ' <span class="badge badge-amber" title="' + m.reconciled + ' request(s) the usage feed never served, added from Command Code per-model totals with estimated tokens and cost.">+' + m.reconciled + ' rec.</span>' : '') + '</td>' +
               '<td>' + fmtNum(m.tokensTotal) + '</td>' +
               '<td>' + pctOf(m.cached, m.inTotal) + '</td>' +
               '<td><strong>' + fmtUsd(m.plan) + '</strong></td>' +
@@ -3263,7 +3819,7 @@ function renderDashboardHtml(initialData) {
         ? '<tr><td colspan="10" style="text-align:center;color:var(--muted);">No date-wise rows for selected range (' + trendPeriod.toUpperCase() + ').</td></tr>'
         : filtered.map(r => {
             const burnTxt = r.is_free_model ? 'Free' : ((r.credit_burn_per_usd !== null && r.credit_burn_per_usd !== undefined) ? (Number(r.credit_burn_per_usd).toFixed(2) + 'x') : '-');
-            return '<tr><td>' + escHtml(r.usage_date) + '</td><td>' + escHtml(r.model) + '</td><td>' + r.requests_count + '</td><td>' + r.failed_wasted_count + '</td><td>' + fmtNum(r.tokens_total) + '</td><td>' + pctOf(r.tokens_cached, r.tokens_in_total) + '</td><td><strong>' + fmtUsd(r.plan_cost) + '</strong></td><td><strong>' + burnTxt + '</strong></td><td><strong>' + Number(r.credits_consumed || 0).toFixed(2) + ' cr</strong></td><td>' + fmtUsd(r.effective_real_usd) + '</td></tr>';
+            return '<tr><td>' + escHtml(r.usage_date) + (r.estimated ? ' <span title="No time of day stored for this date: share of the day estimated from your hour-of-day pattern." style="color:var(--amber)">≈</span>' : '') + '</td><td>' + escHtml(r.model) + '</td><td>' + r.requests_count + '</td><td>' + r.failed_wasted_count + '</td><td>' + fmtNum(r.tokens_total) + '</td><td>' + pctOf(r.tokens_cached, r.tokens_in_total) + '</td><td><strong>' + fmtUsd(r.plan_cost) + '</strong></td><td><strong>' + burnTxt + '</strong></td><td><strong>' + Number(r.credits_consumed || 0).toFixed(2) + ' cr</strong></td><td>' + fmtUsd(r.effective_real_usd) + '</td></tr>';
           }).join('');
     }
 
@@ -3347,14 +3903,16 @@ function renderDashboardHtml(initialData) {
         },
         {
           label: 'Sync Coverage',
-          val: cov ? ((cov.totalFetched ?? 0) + ' requests' + (cov.gapSuspected ? ' (GAP)' : '')) : 'No sync yet',
+          val: cov ? ((cov.totalFetched ?? 0) + ' requests' + (cov.gapSuspected ? ' (GAP' + (cov.reconciledRequests ? ', ' + cov.reconciledRequests + ' reconciled' : '') + ')' : '')) : 'No sync yet',
           sub: (cov && cov.oldestFetchedIso ? 'Feed span: ' + new Date(cov.oldestFetchedIso).toLocaleString() + ' -> ' + new Date(cov.newestFetchedIso).toLocaleString() + ' | ' : '') +
+            (rawData.nextSyncDueTs ? 'Next adaptive sync: ' + new Date(rawData.nextSyncDueTs).toLocaleTimeString() + ' | ' : '') +
+            (rawData.hourlyExactFrom ? 'Hourly data exact from ' + escHtml(rawData.hourlyExactFrom) + ' | ' : '') +
             'Plan: ' + escHtml(g.planName || '-') + ' (' + escHtml(g.planDetectedBy || '-') + ') | Catalog: ' + (cat.planModelsCount || 0) + ' models, ' + catSync
         },
         {
           label: 'D1 Rows & Storage',
           val: (t.totalRows || 0) + ' rows | ' + (st.sizeKb || 0) + ' KB',
-          sub: 'Daily: ' + (t.cc_daily_model_usage || 0) + ' (' + (t.activeDays || 0) + '/90 days) | Ledger: ' + (t.cc_request_credits || 0) + ' | Meta: ' + (t.cc_meta || 0)
+          sub: 'Daily: ' + (t.cc_daily_model_usage || 0) + ' (' + (t.activeDays || 0) + '/90 days) | Hourly: ' + (t.cc_hourly_model_usage || 0) + ' | Ledger: ' + (t.cc_request_credits || 0) + ' | Meta: ' + (t.cc_meta || 0)
         },
         {
           label: 'Latencies',
@@ -3420,7 +3978,7 @@ function renderDashboardHtml(initialData) {
       // RUN IT WHILE commandcode.ai IS OPEN AND LOGGED IN on that device/browser.
       // void() wrapper so iOS Safari doesn't blank the page; per-endpoint statuses
       // are reported in the alert so any failure leg is visible instantly.
-      const bm = "javascript:void((async()=>{try{const u=prompt('Tracker username:','" + bmUser + "');if(!u)return;const p=prompt('Tracker password:');if(!p)return;const st=[];let d={usages:[]};try{const r=await fetch('https://api.commandcode.ai/internal/usage?limit=100',{credentials:'include'});st.push('usage:'+r.status);if(r.ok){d=await r.json();}}catch(e){st.push('usage:ERR');}let wl=null;try{const w=await fetch('https://api.commandcode.ai/internal/billing/credits',{credentials:'include'});st.push('bars:'+w.status);if(w.ok){const wd=await w.json();if(wd&&wd.windowLimits&&wd.windowLimits.fiveHour&&wd.windowLimits.weekly){wl={fiveHour:wd.windowLimits.fiveHour,weekly:wd.windowLimits.weekly,monthlyUsed:(wd.credits&&wd.credits.monthlyCredits)||0,monthlyGranted:(wd.credits&&wd.credits.monthlyCreditsGranted)||null,ts:Date.now()};}}}catch(e){st.push('bars:ERR');}let byModel=null;let bmWin=null;try{const b=await fetch('https://api.commandcode.ai/internal/usage/by-model',{credentials:'include'});st.push('by-model:'+b.status);if(b.ok){const bd=await b.json();if(bd&&Array.isArray(bd.data)){byModel=bd.data;bmWin=bd.window||null;}}}catch(e){st.push('by-model:ERR');}const s=await fetch('" + origin + "/api/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,usages:d.usages||[],windowLimits:wl,byModel:byModel,byModelWindow:bmWin})});st.push('push:'+s.status);const j=await s.json();alert(s.ok?('CC Tracker pushed ['+st.join(', ')+'] +'+(j.newRecordsCount||0)+' new requests'+(wl?' + live bars':'')+(byModel?' + by-model':'')):('Push failed: '+(j.error||s.status)+' ['+st.join(', ')+']'));}catch(e){alert('Sync failed: '+e.message);}})());";
+      const bm = "javascript:void((async()=>{try{const u=prompt('Tracker username:','" + bmUser + "');if(!u)return;const p=prompt('Tracker password:');if(!p)return;const st=[];let byModel=null;let bmWin=null;try{const b=await fetch('https://api.commandcode.ai/internal/usage/by-model',{credentials:'include'});st.push('by-model:'+b.status);if(b.ok){const bd=await b.json();if(bd&&Array.isArray(bd.data)){byModel=bd.data;bmWin=bd.window||null;}}}catch(e){st.push('by-model:ERR');}let d={usages:[]};try{const r=await fetch('https://api.commandcode.ai/internal/usage?limit=100',{credentials:'include'});st.push('usage:'+r.status);if(r.ok){d=await r.json();}}catch(e){st.push('usage:ERR');}let wl=null;try{const w=await fetch('https://api.commandcode.ai/internal/billing/credits',{credentials:'include'});st.push('bars:'+w.status);if(w.ok){const wd=await w.json();if(wd&&wd.windowLimits&&wd.windowLimits.fiveHour&&wd.windowLimits.weekly){wl={fiveHour:wd.windowLimits.fiveHour,weekly:wd.windowLimits.weekly,monthlyUsed:(wd.credits&&wd.credits.monthlyCredits)||0,monthlyGranted:(wd.credits&&wd.credits.monthlyCreditsGranted)||null,ts:Date.now()};}}}catch(e){st.push('bars:ERR');}const s=await fetch('" + origin + "/api/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,usages:d.usages||[],windowLimits:wl,byModel:byModel,byModelWindow:bmWin})});st.push('push:'+s.status);const j=await s.json();alert(s.ok?('CC Tracker pushed ['+st.join(', ')+'] +'+(j.newRecordsCount||0)+' new requests'+(wl?' + live bars':'')+(byModel?' + by-model':'')):('Push failed: '+(j.error||s.status)+' ['+st.join(', ')+']'));}catch(e){alert('Sync failed: '+e.message);}})());";
       const done = () => { msg.textContent = 'Bookmarklet copied! Run it while commandcode.ai is OPEN + logged in. Alert shows per-endpoint statuses (usage / bars / by-model / push).'; };
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(bm).then(done).catch(() => fallbackCopyBookmarklet(bm, msg));
